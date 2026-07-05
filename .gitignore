@@ -1,0 +1,11 @@
+# vendored Seeed binaries -- fetched by get_xvf_host.(sh|ps1)
+host_control/
+
+# output
+recordings/
+*.wav
+
+# python
+.venv/
+__pycache__/
+*.pyc

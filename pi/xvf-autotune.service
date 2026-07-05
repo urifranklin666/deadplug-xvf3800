@@ -1,0 +1,14 @@
+[Unit]
+Description=DEADPLUG XVF3800 autotune + web remote
+After=sound.target network.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/.venv/bin/python @DIR@/autotune.py --headless --serve 8380
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,867 @@
+# DEADPLUG // XVF3800 AUTOTUNE
+# Records from the XVF3800, watches voice levels, and adjusts device DSP
+# parameters on the fly to tune in voices (whispers included).
+#
+# Windows GUI:  pythonw autotune.py            (or "XVF3800 Autotune.cmd")
+# Pi / server:  python3 autotune.py --headless --serve 8380
+# Web remote:   add --serve PORT in GUI mode too; open http://<host>:PORT
+# Smoke test:   set XVF_AUTOTUNE_SMOKETEST=1 -> headless 2 s capture + dry-run
+# tuning decision, prints a summary, exits.
+
+import os
+import sys
+import json
+import math
+import time
+import wave
+import queue
+import platform
+import argparse
+import threading
+import subprocess
+import collections
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import numpy as np
+import sounddevice as sd
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _xvf_host_path():
+    if sys.platform == "win32":
+        sub, exe = "win32", "xvf_host.exe"
+    elif sys.platform == "darwin":
+        sub, exe = "mac_arm64", "xvf_host"
+    else:
+        mach = platform.machine().lower()
+        sub = "rpi_64bit" if mach in ("aarch64", "arm64") else "linux_x86_64"
+        exe = "xvf_host"
+    return os.path.join(HERE, "host_control", sub, exe)
+
+
+XVF_HOST = _xvf_host_path()
+REC_DIR = os.path.join(HERE, "recordings")
+PREROLL_S = 2.0        # audio kept before REC/VOX trigger
+VOX_HANGOVER_S = 2.5   # keep recording this long after voice stops
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+SAMPLE_RATE = 48000
+BLOCK = 4800  # 100 ms
+
+# Control-loop targets and bounds. The device AGC is an inner feedback loop;
+# this outer loop must stay slow (one small step per cycle) or they fight.
+TARGET_DBFS_DEFAULT = -28.0
+DEADBAND_DB = 3.0
+CYCLE_S = 3.0
+MAXGAIN_LO, MAXGAIN_HI = 64.0, 300.0
+DESIRED_LO, DESIRED_HI = 0.003, 0.015
+VAD_MARGIN_DB = 12.0
+VAD_ABS_MIN_DBFS = -50.0  # below this it's never "voice", whatever the floor
+SILENCE_DBFS = -80.0      # startup/underrun zeros; excluded from floor tracking
+OVERSHOOT_PEAK_DB = -6.0
+OVERSHOOT_DROP_DB = 12.0
+
+BG = "#050505"
+PANEL = "#0a0a0a"
+RED = "#ff2222"
+DIMRED = "#7a0f0f"
+TEXT = "#c9c9c9"
+AMBER = "#ffaa00"
+GRAY = "#555555"
+
+
+def dbfs(x):
+    return 20.0 * math.log10(max(float(x), 1e-9))
+
+
+class Xvf:
+    """Serialised access to xvf_host.exe."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def _run(self, *args):
+        with self._lock:
+            try:
+                out = subprocess.run(
+                    [XVF_HOST, *[str(a) for a in args]],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                return out.stdout
+            except Exception:
+                return None
+
+    def get(self, name):
+        out = self._run(name)
+        if not out:
+            return None
+        for line in out.splitlines():
+            if line.startswith(name):
+                try:
+                    return [float(v) for v in line.split()[1:]]
+                except ValueError:
+                    return None
+        return None
+
+    def get1(self, name):
+        vals = self.get(name)
+        return vals[0] if vals else None
+
+    def set(self, name, value):
+        return self._run(name, value) is not None
+
+    def save_to_flash(self):
+        return self._run("save_configuration", "1") is not None
+
+
+class Engine(threading.Thread):
+    """Audio capture + telemetry + the autotune control loop."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.xvf = Xvf()
+        self.log_q = queue.Queue()
+        self.lock = threading.Lock()
+        self.blocks = collections.deque(maxlen=int(10.0 / (BLOCK / SAMPLE_RATE)))
+        self.state = {
+            "audio_ok": False, "device_ok": False,
+            "rms_db": -90.0, "peak_db": -90.0,
+            "noise_floor_db": -70.0, "vad": False,
+            "agc_gain": 0.0, "doa_deg": None, "beam_energy": 0.0,
+            "params": {}, "auto": False, "target_dbfs": TARGET_DBFS_DEFAULT,
+            "last_action": "--",
+            "recording": False, "vox": False, "rec_source": None,
+            "rec_file": "", "rec_started": 0.0,
+        }
+        self._stop = threading.Event()
+        self.log_lines = collections.deque(maxlen=200)
+        self.preroll = collections.deque(
+            maxlen=int(PREROLL_S / (BLOCK / SAMPLE_RATE)))
+        self.rec_q = queue.Queue()
+        self._wav = None
+        self._wav_lock = threading.Lock()
+        self._last_voice = 0.0
+
+    # ---- logging ----
+    def log(self, msg):
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        self.log_q.put(line)
+        self.log_lines.append(line)
+
+    # ---- audio ----
+    def _find_devices(self):
+        """Ranked candidate input devices: WASAPI first, then DirectSound.
+        Refreshes PortAudio's device snapshot first — indices go stale after
+        the XVF3800 re-enumerates, which can silently remap to WDM-KS."""
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+        ranked = []
+        for i, d in enumerate(sd.query_devices()):
+            if "XVF3800" not in d["name"] or d["max_input_channels"] < 1:
+                continue
+            api = sd.query_hostapis(d["hostapi"])["name"]
+            rank = 0 if "WASAPI" in api else 1 if "DirectSound" in api else 2
+            ranked.append((rank, i))
+        return [i for _, i in sorted(ranked)]
+
+    def _audio_cb(self, indata, frames, t, status):
+        mono = indata[:, 0].copy()
+        rms = dbfs(np.sqrt(np.mean(mono ** 2)))
+        peak = dbfs(np.max(np.abs(mono)))
+        self.preroll.append(mono)
+        with self.lock:
+            if self.state["recording"]:
+                self.rec_q.put(mono)
+            nf = self.state["noise_floor_db"]
+            if rms > SILENCE_DBFS:
+                # fast to fall, slow to rise: tracks the quiet between words
+                nf = 0.9 * nf + 0.1 * rms if rms < nf else nf + 0.1
+                nf = max(SILENCE_DBFS, min(nf, -20.0))
+            vad = rms > max(nf + VAD_MARGIN_DB, VAD_ABS_MIN_DBFS)
+            self.state.update(rms_db=rms, peak_db=peak,
+                              noise_floor_db=nf, vad=vad)
+            self.blocks.append((time.monotonic(), rms, peak, vad))
+
+    # ---- recording ----
+    @staticmethod
+    def _to_i16(block):
+        return (np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+    def _drain_rec(self):
+        with self._wav_lock:
+            if self._wav is None:
+                while not self.rec_q.empty():
+                    self.rec_q.get_nowait()
+                return
+            while not self.rec_q.empty():
+                self._wav.writeframes(self._to_i16(self.rec_q.get_nowait()))
+
+    def start_recording(self, source="manual"):
+        with self.lock:
+            if self.state["recording"]:
+                return
+        os.makedirs(REC_DIR, exist_ok=True)
+        path = os.path.join(REC_DIR,
+                            time.strftime("xvf_%Y%m%d_%H%M%S") + ".wav")
+        w = wave.open(path, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        for blk in list(self.preroll):
+            w.writeframes(self._to_i16(blk))
+        with self._wav_lock:
+            self._wav = w
+        with self.lock:
+            self.state["recording"] = True
+            self.state["rec_source"] = source
+            self.state["rec_file"] = os.path.basename(path)
+            self.state["rec_started"] = time.monotonic()
+        self.log(f"REC start ({source}): {os.path.basename(path)} "
+                 f"(+{PREROLL_S:g} s pre-roll)")
+
+    def stop_recording(self):
+        with self.lock:
+            if not self.state["recording"]:
+                return
+            self.state["recording"] = False
+            started = self.state["rec_started"]
+            name = self.state["rec_file"]
+        self._drain_rec()
+        with self._wav_lock:
+            if self._wav is not None:
+                self._wav.close()
+                self._wav = None
+        self.log(f"REC stop: {name} "
+                 f"({time.monotonic() - started + PREROLL_S:.1f} s)")
+
+    # ---- device params ----
+    PARAM_NAMES = ("PP_AGCMAXGAIN", "PP_AGCDESIREDLEVEL", "PP_AGCFASTTIME",
+                   "PP_MIN_NS", "PP_MIN_NN", "PP_AGCONOFF")
+
+    def read_params(self):
+        p = {}
+        for name in self.PARAM_NAMES:
+            v = self.xvf.get1(name)
+            if v is None:
+                with self.lock:
+                    self.state["device_ok"] = False
+                return False
+            p[name] = v
+        with self.lock:
+            self.state["params"] = p
+            self.state["device_ok"] = True
+        return True
+
+    def set_param(self, name, value, reason):
+        value = round(float(value), 6)
+        if value == int(value):
+            value = int(value)  # int32 params reject "1.0"
+        if self.xvf.set(name, value):
+            with self.lock:
+                self.state["params"][name] = value
+                self.state["last_action"] = f"{name} -> {value:g}"
+            self.log(f"AUTO: {name} -> {value:g}  ({reason})")
+
+    # ---- the control loop ----
+    def autotune_step(self, dry_run=False):
+        with self.lock:
+            blocks = [b for b in self.blocks
+                      if b[0] > time.monotonic() - CYCLE_S]
+            p = dict(self.state["params"])
+            target = self.state["target_dbfs"]
+            agc_gain = self.state["agc_gain"]
+        if not blocks or not p:
+            return "no data"
+
+        speech = [b for b in blocks if b[3]]
+        # overshoot: a near-full-scale peak followed shortly by a big RMS drop
+        # while speech continues = AGC slamming into the limiter
+        overshoot = False
+        for i, (t0, rms0, peak0, _) in enumerate(blocks):
+            if peak0 <= OVERSHOOT_PEAK_DB:
+                continue
+            for t1, rms1, _, vad1 in blocks[i + 1:i + 6]:
+                if vad1 and rms1 < rms0 - OVERSHOOT_DROP_DB:
+                    overshoot = True
+                    break
+            if overshoot:
+                break
+
+        decision = None
+        if p.get("PP_AGCONOFF", 1) < 1:
+            decision = ("PP_AGCONOFF", 1,
+                        "AGC was disabled; autotune requires it")
+        elif overshoot:
+            new = max(MAXGAIN_LO, p["PP_AGCMAXGAIN"] * 0.8)
+            if new < p["PP_AGCMAXGAIN"] - 0.5:
+                decision = ("PP_AGCMAXGAIN", new, "overshoot: gain collapse after peak")
+        elif speech:
+            med = float(np.median([b[1] for b in speech]))
+            maxpeak = max(b[2] for b in speech)
+            if med < target - DEADBAND_DB and maxpeak < OVERSHOOT_PEAK_DB:
+                if agc_gain > 0.85 * p["PP_AGCMAXGAIN"]:
+                    new = min(MAXGAIN_HI, p["PP_AGCMAXGAIN"] * 1.25)
+                    if new > p["PP_AGCMAXGAIN"] + 0.5:
+                        decision = ("PP_AGCMAXGAIN", new,
+                                    f"voice {med:.0f} dBFS below target, AGC pegged")
+                else:
+                    new = min(DESIRED_HI, p["PP_AGCDESIREDLEVEL"] * 1.25)
+                    if new > p["PP_AGCDESIREDLEVEL"] * 1.01:
+                        decision = ("PP_AGCDESIREDLEVEL", new,
+                                    f"voice {med:.0f} dBFS below target")
+            elif med > target + DEADBAND_DB:
+                new = max(DESIRED_LO, p["PP_AGCDESIREDLEVEL"] * 0.8)
+                if new < p["PP_AGCDESIREDLEVEL"] * 0.99:
+                    decision = ("PP_AGCDESIREDLEVEL", new,
+                                f"voice {med:.0f} dBFS above target")
+
+        if decision is None:
+            return "hold"
+        if dry_run:
+            return f"would set {decision[0]} -> {decision[1]:g} ({decision[2]})"
+        self.set_param(*decision)
+        return "adjusted"
+
+    # ---- main thread loop ----
+    def run(self):
+        self.read_params()
+        if self.state["device_ok"]:
+            self.log("Device online. " + "  ".join(
+                f"{k.replace('PP_', '')}={v:g}"
+                for k, v in self.state["params"].items()))
+        else:
+            self.log("ERROR: control interface not responding.")
+
+        stream = None
+        last_cycle = last_telem = 0.0
+        while not self._stop.is_set():
+            if stream is None:
+                last_err = "no XVF3800 input device found"
+                for idx in self._find_devices():
+                    try:
+                        d = sd.query_devices(idx)
+                        stream = sd.InputStream(
+                            device=idx, samplerate=SAMPLE_RATE, channels=2,
+                            blocksize=BLOCK, dtype="float32",
+                            callback=self._audio_cb)
+                        stream.start()
+                        with self.lock:
+                            self.state["audio_ok"] = True
+                        api = sd.query_hostapis(d["hostapi"])["name"]
+                        self.log(f"Capture started: {d['name']} [{api}]")
+                        break
+                    except Exception as e:
+                        stream = None
+                        last_err = e
+                if stream is None:
+                    with self.lock:
+                        self.state["audio_ok"] = False
+                    self.log(f"Capture failed ({last_err}); retrying in 5 s")
+                    time.sleep(5)
+                    continue
+
+            now = time.monotonic()
+            self._drain_rec()
+            with self.lock:
+                vad = self.state["vad"]
+                vox = self.state["vox"]
+                rec = self.state["recording"]
+                rec_src = self.state["rec_source"]
+            if vad:
+                self._last_voice = now
+            if vox and not rec and vad:
+                self.start_recording("vox")
+            elif rec and rec_src == "vox" and (
+                    not vox or now - self._last_voice > VOX_HANGOVER_S):
+                self.stop_recording()
+
+            if now - last_telem >= 1.0:
+                last_telem = now
+                gain = self.xvf.get1("PP_AGCGAIN")
+                az = self.xvf.get("AEC_AZIMUTH_VALUES")
+                sp = self.xvf.get("AEC_SPENERGY_VALUES")
+                with self.lock:
+                    if gain is not None:
+                        self.state["agc_gain"] = gain
+                        self.state["device_ok"] = True
+                    else:
+                        self.state["device_ok"] = False
+                    if az and len(az) >= 4:
+                        self.state["doa_deg"] = math.degrees(az[3]) % 360
+                    if sp and len(sp) >= 4:
+                        self.state["beam_energy"] = sp[3]
+            if self.state["auto"] and now - last_cycle >= CYCLE_S:
+                last_cycle = now
+                self.autotune_step()
+            time.sleep(0.1)
+
+        self.stop_recording()
+        if stream is not None:
+            stream.stop()
+            stream.close()
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------------------------------------------------- web remote
+WEB_PAGE = """<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>DEADPLUG // XVF3800</title>
+<style>
+  body { background:#050505; color:#c9c9c9; font-family:ui-monospace,Consolas,monospace;
+         margin:0; padding:14px; max-width:640px; margin-inline:auto; }
+  h1 { color:#ff2222; font-size:18px; margin:0 0 4px; }
+  #status { color:#666; font-size:11px; float:right; margin-top:6px; }
+  hr { border:0; border-top:1px solid #7a0f0f; }
+  canvas { width:100%; height:64px; background:#0a0a0a; border:1px solid #7a0f0f;
+           display:block; margin:10px 0 6px; }
+  #telem { font-size:12px; white-space:pre-wrap; color:#c9c9c9; min-height:3em; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; align-items:center; }
+  button { background:#120606; color:#ff4444; border:1px solid #7a0f0f;
+           font-family:inherit; font-size:14px; padding:10px 16px; cursor:pointer; }
+  button.on { background:#ff2222; color:#050505; }
+  button.amber { color:#ffaa00; border-color:#aa6600; }
+  input[type=range] { flex:1; accent-color:#ff2222; }
+  #log { background:#0a0a0a; border:1px solid #3a0a0a; color:#9a3d3d; font-size:11px;
+         padding:8px; height:130px; overflow-y:auto; white-space:pre-wrap; }
+  #recs div { display:flex; align-items:center; gap:8px; margin:6px 0; font-size:12px; }
+  #recs audio { height:28px; flex:1; min-width:0; }
+  a { color:#ff4444; }
+</style></head><body>
+<span id="status">...</span><h1>DEADPLUG // XVF3800</h1><hr>
+<canvas id="meter" width="640" height="64"></canvas>
+<div id="telem"></div>
+<div class="row">
+  <button id="rec">REC</button>
+  <button id="vox">VOX OFF</button>
+  <button id="auto">AUTO OFF</button>
+  <button id="save" class="amber">SAVE TO FLASH</button>
+</div>
+<div class="row"><span>TARGET dBFS <b id="tval">-28</b></span>
+  <input type="range" id="target" min="-40" max="-15" step="1" value="-28">
+</div>
+<div id="log"></div>
+<h1 style="font-size:14px;margin-top:14px">RECORDINGS</h1>
+<div id="recs"></div>
+<script>
+const $ = id => document.getElementById(id);
+let state = null;
+function post(url, body) {
+  return fetch(url, {method:'POST', body: JSON.stringify(body||{})});
+}
+$('rec').onclick  = () => post('/api/rec', {on: !(state && state.recording)});
+$('vox').onclick  = () => post('/api/toggle', {what:'vox'});
+$('auto').onclick = () => post('/api/toggle', {what:'auto'});
+$('save').onclick = () => post('/api/save');
+$('target').oninput = e => { $('tval').textContent = e.target.value; };
+$('target').onchange = e => post('/api/target', {dbfs: +e.target.value});
+function x(db, w) { return Math.max(0, Math.min(w, (db + 70) / 70 * w)); }
+function draw(s) {
+  const c = $('meter'), g = c.getContext('2d'), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = '#ff2222'; g.fillRect(0, 8, x(s.rms_db, w), 22);
+  g.fillStyle = '#ff8888'; g.fillRect(x(s.peak_db, w) - 2, 8, 4, 22);
+  g.strokeStyle = '#555';
+  g.beginPath(); g.moveTo(x(s.noise_floor_db, w), 4);
+  g.lineTo(x(s.noise_floor_db, w), 34); g.stroke();
+  g.strokeStyle = '#ffaa00'; g.setLineDash([3, 2]);
+  g.beginPath(); g.moveTo(x(s.target_dbfs, w), 4);
+  g.lineTo(x(s.target_dbfs, w), 34); g.stroke(); g.setLineDash([]);
+  g.font = 'bold 16px monospace';
+  g.fillStyle = s.vad ? '#ff2222' : '#555';
+  g.fillText(s.vad ? 'VOICE' : '.....', 6, 54);
+  g.fillStyle = '#c9c9c9'; g.font = '12px monospace'; g.textAlign = 'right';
+  g.fillText(s.rms_db.toFixed(1) + ' dBFS  pk ' + s.peak_db.toFixed(1), w - 6, 54);
+  g.textAlign = 'left';
+}
+async function tick() {
+  try {
+    const s = await (await fetch('/api/state')).json();
+    state = s;
+    draw(s);
+    const p = s.params || {};
+    const doa = s.doa_deg == null ? '--' : s.doa_deg.toFixed(0) + ' deg';
+    $('telem').textContent =
+      'AGC GAIN ' + s.agc_gain.toFixed(2) + '   DOA ' + doa + '\\n' +
+      'MAXGAIN ' + (p.PP_AGCMAXGAIN||0) + '   TARGET LVL ' + (p.PP_AGCDESIREDLEVEL||0) +
+      '   NS ' + (p.PP_MIN_NS||0) + '/' + (p.PP_MIN_NN||0) + '\\n' +
+      'LAST: ' + s.last_action +
+      (s.recording ? '   REC ' + s.rec_file : '');
+    $('rec').textContent = s.recording ? 'STOP' : 'REC';
+    $('rec').className = s.recording ? 'on' : '';
+    $('vox').textContent = 'VOX ' + (s.vox ? 'ON' : 'OFF');
+    $('vox').className = s.vox ? 'on' : '';
+    $('auto').textContent = 'AUTO ' + (s.auto ? 'ON' : 'OFF');
+    $('auto').className = s.auto ? 'on' : '';
+    $('status').textContent =
+      (s.device_ok ? 'CTRL ONLINE' : 'CTRL OFFLINE') + ' | ' +
+      (s.audio_ok ? 'AUDIO OK' : 'NO AUDIO');
+    $('status').style.color = (s.device_ok && s.audio_ok) ? '#ff2222' : '#666';
+    const lg = $('log'), atEnd = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 4;
+    lg.textContent = (s.log || []).join('\\n');
+    if (atEnd) lg.scrollTop = lg.scrollHeight;
+  } catch (e) {
+    $('status').textContent = 'LINK LOST'; $('status').style.color = '#666';
+  }
+}
+async function recs() {
+  try {
+    const list = await (await fetch('/api/recordings')).json();
+    $('recs').innerHTML = list.slice(0, 12).map(r =>
+      '<div><a href="/rec/' + r.name + '" download>' + r.name + '</a>' +
+      '<audio controls preload="none" src="/rec/' + r.name + '"></audio>' +
+      '<span>' + (r.size/1024|0) + ' kB</span></div>').join('');
+  } catch (e) {}
+}
+setInterval(tick, 400); tick();
+setInterval(recs, 5000); recs();
+</script></body></html>
+"""
+
+
+def make_handler(eng):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, WEB_PAGE.encode(), "text/html; charset=utf-8")
+            elif self.path == "/api/state":
+                with eng.lock:
+                    s = {k: v for k, v in eng.state.items() if k != "params"}
+                    s["params"] = dict(eng.state["params"])
+                s["log"] = list(eng.log_lines)[-30:]
+                self._send(200, s)
+            elif self.path == "/api/recordings":
+                out = []
+                if os.path.isdir(REC_DIR):
+                    for n in os.listdir(REC_DIR):
+                        if n.lower().endswith(".wav"):
+                            st = os.stat(os.path.join(REC_DIR, n))
+                            out.append({"name": n, "size": st.st_size,
+                                        "mtime": st.st_mtime})
+                out.sort(key=lambda r: r["mtime"], reverse=True)
+                self._send(200, out)
+            elif self.path.startswith("/rec/"):
+                name = os.path.basename(self.path[len("/rec/"):])
+                path = os.path.join(REC_DIR, name)
+                if name.lower().endswith(".wav") and os.path.isfile(path):
+                    with open(path, "rb") as f:
+                        self._send(200, f.read(), "audio/wav")
+                else:
+                    self._send(404, {"error": "not found"})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                body = {}
+            if self.path == "/api/toggle" and body.get("what") in ("auto", "vox"):
+                what = body["what"]
+                with eng.lock:
+                    eng.state[what] = not eng.state[what]
+                    on = eng.state[what]
+                eng.log(f"{what.upper()} {'engaged' if on else 'off'} (web).")
+            elif self.path == "/api/rec":
+                if body.get("on"):
+                    eng.start_recording("manual")
+                else:
+                    eng.stop_recording()
+            elif self.path == "/api/target":
+                try:
+                    v = max(-40.0, min(-15.0, float(body.get("dbfs"))))
+                    with eng.lock:
+                        eng.state["target_dbfs"] = v
+                except (TypeError, ValueError):
+                    pass
+            elif self.path == "/api/save":
+                eng.xvf.save_to_flash()
+                eng.log("Configuration saved to device flash (web).")
+            else:
+                self._send(404, {"error": "not found"})
+                return
+            self._send(200, {"ok": True})
+
+    return Handler
+
+
+def serve(eng, port):
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(eng))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    eng.log(f"Web remote listening on port {port}.")
+    return httpd
+
+
+# ---------------------------------------------------------------- smoke test
+def smoke_test():
+    eng = Engine()
+    ok_dev = eng.read_params()
+    candidates = eng._find_devices()
+    print(f"device_params_ok={ok_dev} audio_candidates={candidates}")
+    if not candidates:
+        print("SMOKETEST FAIL: no XVF3800 input device")
+        return 1
+    idx = candidates[0]
+    d = sd.query_devices(idx)
+    print(f"using [{idx}] {d['name']} "
+          f"[{sd.query_hostapis(d['hostapi'])['name']}]")
+    with sd.InputStream(device=idx, samplerate=SAMPLE_RATE, channels=2,
+                        blocksize=BLOCK, dtype="float32",
+                        callback=eng._audio_cb):
+        time.sleep(2.2)
+        eng.start_recording("smoketest")
+        time.sleep(1.0)
+        eng.stop_recording()
+    s = eng.state
+    print(f"rms={s['rms_db']:.1f} dBFS peak={s['peak_db']:.1f} dBFS "
+          f"noise_floor={s['noise_floor_db']:.1f} vad={s['vad']} "
+          f"blocks={len(eng.blocks)}")
+    path = os.path.join(REC_DIR, s["rec_file"])
+    with wave.open(path, "rb") as w:
+        dur = w.getnframes() / w.getframerate()
+    print(f"recording: {s['rec_file']} {dur:.2f} s "
+          f"({os.path.getsize(path)} bytes)")
+    print("dry-run decision:", eng.autotune_step(dry_run=True))
+    print("SMOKETEST OK" if ok_dev else "SMOKETEST PARTIAL (audio ok, control offline)")
+    return 0
+
+
+# ------------------------------------------------------------------------ UI
+def main(serve_port=None):
+    import tkinter as tk
+
+    eng = Engine()
+    eng.start()
+    if serve_port:
+        serve(eng, serve_port)
+
+    root = tk.Tk()
+    root.title("DEADPLUG // XVF3800 AUTOTUNE")
+    root.configure(bg=BG)
+    root.geometry("640x600")
+
+    mono = ("Consolas", 10)
+    mono_b = ("Consolas", 14, "bold")
+
+    head = tk.Frame(root, bg=BG)
+    head.pack(fill="x", padx=14, pady=(12, 4))
+    tk.Label(head, text="DEADPLUG // XVF3800 AUTOTUNE", bg=BG, fg=RED,
+             font=("Consolas", 15, "bold")).pack(side="left")
+    status_lbl = tk.Label(head, text="...", bg=BG, fg=GRAY, font=mono)
+    status_lbl.pack(side="right")
+    tk.Frame(root, bg=DIMRED, height=1).pack(fill="x", padx=14)
+
+    # level meter
+    meter = tk.Canvas(root, height=64, bg=PANEL, highlightthickness=1,
+                      highlightbackground=DIMRED)
+    meter.pack(fill="x", padx=14, pady=(10, 4))
+
+    telem_lbl = tk.Label(root, text="", bg=BG, fg=TEXT, font=mono, anchor="w",
+                         justify="left")
+    telem_lbl.pack(fill="x", padx=14)
+
+    # controls
+    ctl = tk.Frame(root, bg=BG)
+    ctl.pack(fill="x", padx=14, pady=8)
+
+    def styled_btn(parent, text, cmd, fg=RED):
+        return tk.Button(parent, text=text, command=cmd, bg="#120606", fg=fg,
+                         activebackground="#2a0a0a", activeforeground=fg,
+                         relief="solid", bd=1, font=mono, padx=12, pady=4,
+                         highlightbackground=DIMRED, cursor="hand2")
+
+    auto_btn = None
+
+    def toggle_auto():
+        with eng.lock:
+            eng.state["auto"] = not eng.state["auto"]
+            on = eng.state["auto"]
+        auto_btn.configure(text=f"AUTO {'ON' if on else 'OFF'}",
+                           fg=BG if on else RED,
+                           bg=RED if on else "#120606")
+        eng.log(f"Autotune {'engaged' if on else 'disengaged'}.")
+
+    auto_btn = styled_btn(ctl, "AUTO OFF", toggle_auto)
+    auto_btn.pack(side="left", padx=(0, 8))
+    styled_btn(ctl, "SAVE TO FLASH",
+               lambda: (eng.xvf.save_to_flash(),
+                        eng.log("Configuration saved to device flash.")),
+               fg=AMBER).pack(side="left", padx=(0, 16))
+
+    tk.Label(ctl, text="TARGET dBFS", bg=BG, fg=TEXT, font=mono).pack(side="left")
+    target_var = tk.DoubleVar(value=TARGET_DBFS_DEFAULT)
+
+    def on_target(_=None):
+        with eng.lock:
+            eng.state["target_dbfs"] = target_var.get()
+
+    tk.Scale(ctl, from_=-40, to=-15, resolution=1, orient="horizontal",
+             variable=target_var, command=on_target, bg=BG, fg=RED,
+             troughcolor=PANEL, highlightthickness=0, font=mono,
+             activebackground=RED, length=180).pack(side="left", padx=8)
+
+    # recording controls
+    rec_row = tk.Frame(root, bg=BG)
+    rec_row.pack(fill="x", padx=14, pady=(0, 4))
+
+    rec_btn = None
+
+    def toggle_rec():
+        with eng.lock:
+            rec = eng.state["recording"]
+        if rec:
+            eng.stop_recording()
+        else:
+            eng.start_recording("manual")
+
+    rec_btn = styled_btn(rec_row, "REC", toggle_rec)
+    rec_btn.pack(side="left", padx=(0, 8))
+
+    vox_btn = None
+
+    def toggle_vox():
+        with eng.lock:
+            eng.state["vox"] = not eng.state["vox"]
+            on = eng.state["vox"]
+        vox_btn.configure(text=f"VOX {'ON' if on else 'OFF'}",
+                          fg=BG if on else RED,
+                          bg=RED if on else "#120606")
+        eng.log(f"VOX {'armed: recording on voice detect' if on else 'off'}.")
+
+    vox_btn = styled_btn(rec_row, "VOX OFF", toggle_vox)
+    vox_btn.pack(side="left", padx=(0, 8))
+    def open_rec_dir():
+        os.makedirs(REC_DIR, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(REC_DIR)
+        else:
+            subprocess.Popen(["xdg-open", REC_DIR])
+
+    styled_btn(rec_row, "RECORDINGS", open_rec_dir,
+               fg=TEXT).pack(side="left", padx=(0, 12))
+    rec_lbl = tk.Label(rec_row, text="rec idle", bg=BG, fg=GRAY, font=mono)
+    rec_lbl.pack(side="left")
+
+    # log
+    log_box = tk.Text(root, bg=PANEL, fg="#9a3d3d", font=("Consolas", 9),
+                      relief="solid", bd=1, highlightbackground=DIMRED,
+                      state="disabled", wrap="word")
+    log_box.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+
+    def db_to_x(db, width):
+        return max(0, min(width, (db + 70.0) / 70.0 * width))
+
+    def refresh():
+        with eng.lock:
+            s = dict(eng.state)
+        w = meter.winfo_width() or 600
+        meter.delete("all")
+        meter.create_rectangle(0, 8, db_to_x(s["rms_db"], w), 30,
+                               fill=RED, width=0)
+        px = db_to_x(s["peak_db"], w)
+        meter.create_rectangle(px - 2, 8, px + 2, 30, fill="#ff8888", width=0)
+        nx = db_to_x(s["noise_floor_db"], w)
+        meter.create_line(nx, 4, nx, 34, fill=GRAY)
+        tx = db_to_x(s["target_dbfs"], w)
+        meter.create_line(tx, 4, tx, 34, fill=AMBER, dash=(3, 2))
+        meter.create_text(6, 48, anchor="w", fill=RED if s["vad"] else GRAY,
+                          font=mono_b, text="VOICE" if s["vad"] else "·····")
+        meter.create_text(w - 6, 48, anchor="e", fill=TEXT, font=mono,
+                          text=f"{s['rms_db']:6.1f} dBFS  pk {s['peak_db']:6.1f}")
+
+        doa = f"{s['doa_deg']:.0f} deg" if s["doa_deg"] is not None else "--"
+        p = s["params"]
+        telem_lbl.configure(text=(
+            f"AGC GAIN {s['agc_gain']:7.2f}   DOA {doa:>8}   "
+            f"BEAM E {s['beam_energy']:.3g}\n"
+            f"MAXGAIN {p.get('PP_AGCMAXGAIN', 0):g}   "
+            f"TARGET LVL {p.get('PP_AGCDESIREDLEVEL', 0):g}   "
+            f"NS {p.get('PP_MIN_NS', 0):g}/{p.get('PP_MIN_NN', 0):g}   "
+            f"LAST: {s['last_action']}"))
+
+        if s["recording"]:
+            elapsed = time.monotonic() - s["rec_started"] + PREROLL_S
+            rec_lbl.configure(
+                text=f"REC ● {s['rec_file']}  {elapsed:.0f} s"
+                     f"  [{s['rec_source']}]", fg=RED)
+            rec_btn.configure(text="STOP", fg=BG, bg=RED)
+        else:
+            rec_lbl.configure(text="rec idle", fg=GRAY)
+            rec_btn.configure(text="REC", fg=RED, bg="#120606")
+
+        dev = "CTRL ONLINE" if s["device_ok"] else "CTRL OFFLINE"
+        aud = "AUDIO OK" if s["audio_ok"] else "NO AUDIO"
+        status_lbl.configure(
+            text=f"{dev} | {aud}",
+            fg=RED if s["device_ok"] and s["audio_ok"] else GRAY)
+
+        try:
+            while True:
+                line = eng.log_q.get_nowait()
+                log_box.configure(state="normal")
+                log_box.insert("end", line + "\n")
+                log_box.see("end")
+                log_box.configure(state="disabled")
+        except queue.Empty:
+            pass
+        root.after(100, refresh)
+
+    refresh()
+
+    def on_close():
+        eng.stop()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
+def main_headless(port):
+    eng = Engine()
+    eng.start()
+    serve(eng, port)
+    try:
+        while True:
+            try:
+                print(eng.log_q.get(timeout=1.0), flush=True)
+            except queue.Empty:
+                pass
+    except KeyboardInterrupt:
+        eng.stop()
+
+
+if __name__ == "__main__":
+    if os.environ.get("XVF_AUTOTUNE_SMOKETEST") == "1":
+        sys.exit(smoke_test())
+    ap = argparse.ArgumentParser(description="DEADPLUG // XVF3800 AUTOTUNE")
+    ap.add_argument("--headless", action="store_true",
+                    help="no GUI; run engine + web remote (for Raspberry Pi)")
+    ap.add_argument("--serve", type=int, nargs="?", const=8380, default=None,
+                    metavar="PORT", help="serve the web remote (default 8380)")
+    args = ap.parse_args()
+    if args.headless:
+        main_headless(args.serve or 8380)
+    else:
+        main(serve_port=args.serve)
