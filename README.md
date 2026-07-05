@@ -74,6 +74,17 @@ when it sees the overshoot signature (near-full-scale peak followed by an
 abrupt level collapse). Deliberately slow so it doesn't fight the device's
 own AGC. It also re-enables `PP_AGCONOFF` if something switched it off.
 
+## Beam locking
+
+The 4-mic array continuously estimates where the voice is coming from
+(`AEC_AZIMUTH_VALUES`). The **LOCK** button (GUI and web remote) averages the
+voice bearings heard over the last 15 s and fixes both focused beams on that
+direction (`AEC_FIXEDBEAMSAZIMUTH_VALUES` + `AEC_FIXEDBEAMSONOFF`), with beam
+gating disabled so a quiet whisper is never muted. The array then physically
+focuses on the speaker instead of steering toward whatever is loudest —
+useful when a whisperer competes with a TV or fan. Speak (or whisper) first
+so there's a bearing to lock to; LOCK again releases back to auto tracking.
+
 ## Recording
 
 Timestamped mono 48 kHz WAVs in `recordings/`. Every recording includes a 2 s
@@ -92,6 +103,3 @@ prints a dry-run tuning decision.
 ## Notes
 
 - The web remote has no auth — LAN use only.
-- `AEC_AZIMUTH_VALUES` / `AEC_SPENERGY_VALUES` telemetry (voice direction,
-  per-beam energy) is displayed; beam-locking onto the detected direction is
-  the planned next phase.

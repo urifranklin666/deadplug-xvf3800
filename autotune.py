@@ -89,6 +89,8 @@ class Xvf:
                     capture_output=True, text=True, timeout=10,
                     creationflags=CREATE_NO_WINDOW,
                 )
+                if out.returncode != 0:
+                    return None
                 return out.stdout
             except Exception:
                 return None
@@ -112,6 +114,9 @@ class Xvf:
     def set(self, name, value):
         return self._run(name, value) is not None
 
+    def set_multi(self, name, *values):
+        return self._run(name, *[f"{v:.6f}" for v in values]) is not None
+
     def save_to_flash(self):
         return self._run("save_configuration", "1") is not None
 
@@ -134,7 +139,9 @@ class Engine(threading.Thread):
             "last_action": "--",
             "recording": False, "vox": False, "rec_source": None,
             "rec_file": "", "rec_started": 0.0,
+            "beam_lock": False, "locked_az_deg": None, "doa_rad": None,
         }
+        self.doa_hist = collections.deque(maxlen=30)  # (t, azimuth) w/ voice
         self._stop = threading.Event()
         self.log_lines = collections.deque(maxlen=200)
         self.preroll = collections.deque(
@@ -267,6 +274,46 @@ class Engine(threading.Thread):
                 self.state["last_action"] = f"{name} -> {value:g}"
             self.log(f"AUTO: {name} -> {value:g}  ({reason})")
 
+    # ---- beam locking ----
+    def lock_beam(self):
+        """Fix both focused beams on the voice's bearing (circular mean of
+        DOA samples taken while voice was active in the last 15 s)."""
+        cutoff = time.monotonic() - 15.0
+        with self.lock:
+            angles = [a for t, a in self.doa_hist if t > cutoff]
+            fallback = self.state.get("doa_rad")
+        if not angles:
+            if fallback is None:
+                self.log("LOCK: no voice bearing yet - speak first, then lock.")
+                return False
+            angles = [fallback]
+        az = math.atan2(sum(math.sin(a) for a in angles) / len(angles),
+                        sum(math.cos(a) for a in angles) / len(angles))
+        az %= 2 * math.pi
+        ok = (self.xvf.set_multi("AEC_FIXEDBEAMSAZIMUTH_VALUES", az, az)
+              and self.xvf.set("AEC_FIXEDBEAMSGATING", 0)  # never mute a beam
+              and self.xvf.set("AEC_FIXEDBEAMSONOFF", 1))
+        if ok:
+            deg = math.degrees(az) % 360
+            with self.lock:
+                self.state["beam_lock"] = True
+                self.state["locked_az_deg"] = deg
+            self.log(f"LOCK: beams fixed at {deg:.0f} deg "
+                     f"({len(angles)} voice bearing(s) averaged).")
+        else:
+            self.log("LOCK failed: control interface not responding.")
+        return ok
+
+    def unlock_beam(self):
+        if self.xvf.set("AEC_FIXEDBEAMSONOFF", 0):
+            with self.lock:
+                self.state["beam_lock"] = False
+                self.state["locked_az_deg"] = None
+            self.log("LOCK released: auto beam tracking restored.")
+            return True
+        self.log("UNLOCK failed: control interface not responding.")
+        return False
+
     # ---- the control loop ----
     def autotune_step(self, dry_run=False):
         with self.lock:
@@ -334,6 +381,14 @@ class Engine(threading.Thread):
             self.log("Device online. " + "  ".join(
                 f"{k.replace('PP_', '')}={v:g}"
                 for k, v in self.state["params"].items()))
+            if self.xvf.get1("AEC_FIXEDBEAMSONOFF"):
+                azv = self.xvf.get("AEC_FIXEDBEAMSAZIMUTH_VALUES")
+                with self.lock:
+                    self.state["beam_lock"] = True
+                    if azv:
+                        self.state["locked_az_deg"] = \
+                            math.degrees(azv[0]) % 360
+                self.log("Device already in fixed-beam mode.")
         else:
             self.log("ERROR: control interface not responding.")
 
@@ -393,6 +448,9 @@ class Engine(threading.Thread):
                         self.state["device_ok"] = False
                     if az and len(az) >= 4:
                         self.state["doa_deg"] = math.degrees(az[3]) % 360
+                        self.state["doa_rad"] = az[3]
+                        if self.state["vad"]:
+                            self.doa_hist.append((now, az[3]))
                     if sp and len(sp) >= 4:
                         self.state["beam_energy"] = sp[3]
             if self.state["auto"] and now - last_cycle >= CYCLE_S:
@@ -445,6 +503,7 @@ WEB_PAGE = """<!doctype html>
   <button id="rec">REC</button>
   <button id="vox">VOX OFF</button>
   <button id="auto">AUTO OFF</button>
+  <button id="lock">LOCK</button>
   <button id="save" class="amber">SAVE TO FLASH</button>
 </div>
 <div class="row"><span>TARGET dBFS <b id="tval">-28</b></span>
@@ -462,6 +521,7 @@ function post(url, body) {
 $('rec').onclick  = () => post('/api/rec', {on: !(state && state.recording)});
 $('vox').onclick  = () => post('/api/toggle', {what:'vox'});
 $('auto').onclick = () => post('/api/toggle', {what:'auto'});
+$('lock').onclick = () => post('/api/lock', {on: !(state && state.beam_lock)});
 $('save').onclick = () => post('/api/save');
 $('target').oninput = e => { $('tval').textContent = e.target.value; };
 $('target').onchange = e => post('/api/target', {dbfs: +e.target.value});
@@ -503,6 +563,10 @@ async function tick() {
     $('vox').className = s.vox ? 'on' : '';
     $('auto').textContent = 'AUTO ' + (s.auto ? 'ON' : 'OFF');
     $('auto').className = s.auto ? 'on' : '';
+    $('lock').textContent = s.beam_lock
+      ? 'LOCK' + (s.locked_az_deg == null ? '' : ' ' + s.locked_az_deg.toFixed(0) + '\\u00b0')
+      : 'LOCK';
+    $('lock').className = s.beam_lock ? 'on' : '';
     $('status').textContent =
       (s.device_ok ? 'CTRL ONLINE' : 'CTRL OFFLINE') + ' | ' +
       (s.audio_ok ? 'AUDIO OK' : 'NO AUDIO');
@@ -596,6 +660,11 @@ def make_handler(eng):
                         eng.state["target_dbfs"] = v
                 except (TypeError, ValueError):
                     pass
+            elif self.path == "/api/lock":
+                if body.get("on"):
+                    eng.lock_beam()
+                else:
+                    eng.unlock_beam()
             elif self.path == "/api/save":
                 eng.xvf.save_to_flash()
                 eng.log("Configuration saved to device flash (web).")
@@ -705,6 +774,17 @@ def main(serve_port=None):
 
     auto_btn = styled_btn(ctl, "AUTO OFF", toggle_auto)
     auto_btn.pack(side="left", padx=(0, 8))
+
+    lock_btn = None
+
+    def toggle_lock():
+        with eng.lock:
+            locked = eng.state["beam_lock"]
+        target_fn = eng.unlock_beam if locked else eng.lock_beam
+        threading.Thread(target=target_fn, daemon=True).start()
+
+    lock_btn = styled_btn(ctl, "LOCK", toggle_lock)
+    lock_btn.pack(side="left", padx=(0, 8))
     styled_btn(ctl, "SAVE TO FLASH",
                lambda: (eng.xvf.save_to_flash(),
                         eng.log("Configuration saved to device flash.")),
@@ -800,6 +880,13 @@ def main(serve_port=None):
             f"TARGET LVL {p.get('PP_AGCDESIREDLEVEL', 0):g}   "
             f"NS {p.get('PP_MIN_NS', 0):g}/{p.get('PP_MIN_NN', 0):g}   "
             f"LAST: {s['last_action']}"))
+
+        if s["beam_lock"]:
+            az_txt = ("" if s["locked_az_deg"] is None
+                      else f" {s['locked_az_deg']:.0f}°")
+            lock_btn.configure(text=f"LOCK{az_txt}", fg=BG, bg=RED)
+        else:
+            lock_btn.configure(text="LOCK", fg=RED, bg="#120606")
 
         if s["recording"]:
             elapsed = time.monotonic() - s["rec_started"] + PREROLL_S
