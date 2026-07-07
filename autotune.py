@@ -77,6 +77,16 @@ SILENCE_DBFS = -80.0      # startup/underrun zeros; excluded from floor tracking
 OVERSHOOT_PEAK_DB = -6.0
 OVERSHOOT_DROP_DB = 12.0
 
+# user-tunable device params: name -> (label, lo, hi, step)
+TUNABLES = {
+    "AUDIO_MGR_MIC_GAIN": ("MIC GAIN", 0, 255, 1),
+    "PP_AGCMAXGAIN": ("AGC MAX GAIN", 1, 500, 1),
+    "PP_AGCDESIREDLEVEL": ("AGC TARGET LVL", 0.001, 0.02, 0.0005),
+    "PP_MIN_NS": ("NS FLOOR / STATIONARY (lower = cleaner, riskier)", 0.0, 1.0, 0.01),
+    "PP_MIN_NN": ("NS FLOOR / NON-STAT (lower = cleaner, riskier)", 0.0, 1.0, 0.01),
+    "AEC_HPFONOFF": ("HIGH-PASS  0=off 1=70Hz 2=125Hz 3=150Hz 4=180Hz", 0, 4, 1),
+}
+
 BG = "#050505"
 PANEL = "#0a0a0a"
 RED = "#ff2222"
@@ -173,7 +183,7 @@ class Engine(threading.Thread):
             "recording": False, "vox": False, "rec_source": None,
             "rec_file": "", "rec_started": 0.0,
             "beam_lock": False, "locked_az_deg": None, "doa_rad": None,
-            "scan": True,
+            "scan": False,
         }
         self._voice_until = 0.0
         self._voice_az = None
@@ -284,7 +294,8 @@ class Engine(threading.Thread):
 
     # ---- device params ----
     PARAM_NAMES = ("PP_AGCMAXGAIN", "PP_AGCDESIREDLEVEL", "PP_AGCFASTTIME",
-                   "PP_MIN_NS", "PP_MIN_NN", "PP_AGCONOFF")
+                   "PP_MIN_NS", "PP_MIN_NN", "PP_AGCONOFF",
+                   "AUDIO_MGR_MIC_GAIN", "AEC_HPFONOFF")
 
     def read_params(self):
         p = {}
@@ -300,7 +311,7 @@ class Engine(threading.Thread):
             self.state["device_ok"] = True
         return True
 
-    def set_param(self, name, value, reason):
+    def set_param(self, name, value, reason, tag="AUTO"):
         value = round(float(value), 6)
         if value == int(value):
             value = int(value)  # int32 params reject "1.0"
@@ -308,7 +319,9 @@ class Engine(threading.Thread):
             with self.lock:
                 self.state["params"][name] = value
                 self.state["last_action"] = f"{name} -> {value:g}"
-            self.log(f"AUTO: {name} -> {value:g}  ({reason})")
+            self.log(f"{tag}: {name} -> {value:g}  ({reason})")
+        else:
+            self.log(f"{tag}: {name} write failed (device offline?)")
 
     # ---- beam locking ----
     def lock_beam(self):
@@ -612,8 +625,13 @@ WEB_PAGE = """<!doctype html>
   <button id="scan">SCAN</button>
   <button id="auto">AUTO OFF</button>
   <button id="lock">LOCK</button>
+  <button id="agc">AGC</button>
   <button id="save" class="amber">SAVE TO FLASH</button>
 </div>
+<details style="margin:10px 0">
+  <summary style="color:#ff4444;cursor:pointer">TUNING</summary>
+  <div id="tuners"></div>
+</details>
 <div class="row"><span>TARGET dBFS <b id="tval">-28</b></span>
   <input type="range" id="target" min="-40" max="-15" step="1" value="-28">
 </div>
@@ -631,7 +649,27 @@ $('vox').onclick  = () => post('/api/toggle', {what:'vox'});
 $('scan').onclick = () => post('/api/toggle', {what:'scan'});
 $('auto').onclick = () => post('/api/toggle', {what:'auto'});
 $('lock').onclick = () => post('/api/lock', {on: !(state && state.beam_lock)});
+$('agc').onclick = () => post('/api/param', {name: 'PP_AGCONOFF',
+  value: (state && state.params && state.params.PP_AGCONOFF >= 1) ? 0 : 1});
 $('save').onclick = () => post('/api/save');
+const TUNABLES = {
+  'AUDIO_MGR_MIC_GAIN': ['MIC GAIN', 0, 255, 1],
+  'PP_AGCMAXGAIN': ['AGC MAX GAIN', 1, 500, 1],
+  'PP_AGCDESIREDLEVEL': ['AGC TARGET LVL', 0.001, 0.02, 0.0005],
+  'PP_MIN_NS': ['NS FLOOR STAT', 0, 1, 0.01],
+  'PP_MIN_NN': ['NS FLOOR NON-STAT', 0, 1, 0.01],
+  'AEC_HPFONOFF': ['HIGH-PASS 0=off 1..4=70/125/150/180Hz', 0, 4, 1],
+};
+$('tuners').innerHTML = Object.entries(TUNABLES).map(([n, t]) =>
+  '<div class="row" style="margin:6px 0"><span style="font-size:11px">' + t[0] +
+  ' <b id="v_' + n + '" style="color:#ff4444"></b></span>' +
+  '<input type="range" data-p="' + n + '" min="' + t[1] + '" max="' + t[2] +
+  '" step="' + t[3] + '" style="width:100%"></div>').join('');
+document.querySelectorAll('input[data-p]').forEach(el => {
+  el.oninput = () => { $('v_' + el.dataset.p).textContent = el.value; };
+  el.onchange = () => post('/api/param', {name: el.dataset.p, value: +el.value});
+});
+let tsync = false;
 $('target').oninput = e => { $('tval').textContent = e.target.value; };
 $('target').onchange = e => post('/api/target', {dbfs: +e.target.value});
 function x(db, w) { return Math.max(0, Math.min(w, (db + 70) / 70 * w)); }
@@ -672,6 +710,19 @@ async function tick() {
     $('vox').className = s.vox ? 'on' : '';
     $('scan').textContent = 'SCAN ' + (s.scan ? 'ON' : 'OFF');
     $('scan').className = s.scan ? 'on' : '';
+    const agcOn = (p.PP_AGCONOFF || 0) >= 1;
+    $('agc').textContent = 'AGC ' + (agcOn ? 'ON' : 'OFF');
+    $('agc').className = agcOn ? 'on' : '';
+    if (!tsync && p.PP_AGCMAXGAIN !== undefined) {
+      document.querySelectorAll('input[data-p]').forEach(el => {
+        const v = p[el.dataset.p];
+        if (v !== undefined) {
+          el.value = v;
+          $('v_' + el.dataset.p).textContent = v;
+        }
+      });
+      tsync = true;
+    }
     $('auto').textContent = 'AUTO ' + (s.auto ? 'ON' : 'OFF');
     $('auto').className = s.auto ? 'on' : '';
     $('lock').textContent = s.beam_lock
@@ -771,6 +822,21 @@ def make_handler(eng):
                         eng.state["target_dbfs"] = v
                 except (TypeError, ValueError):
                     pass
+            elif self.path == "/api/param":
+                name = body.get("name")
+                spec = TUNABLES.get(name)
+                if spec is None and name == "PP_AGCONOFF":
+                    spec = ("AGC", 0, 1, 1)
+                try:
+                    v = float(body.get("value"))
+                except (TypeError, ValueError):
+                    spec = None
+                if spec is not None:
+                    v = max(spec[1], min(spec[2], v))
+                    eng.set_param(name, v, "web tuning", "SET")
+                else:
+                    self._send(400, {"error": "bad param"})
+                    return
             elif self.path == "/api/lock":
                 if body.get("on"):
                     eng.lock_beam()
@@ -840,7 +906,7 @@ def main(serve_port=None):
     root = tk.Tk()
     root.title("DEADPLUG // XVF3800 AUTOTUNE")
     root.configure(bg=BG)
-    root.geometry("640x600")
+    root.geometry("700x920")
 
     mono = ("Consolas", 10)
     mono_b = ("Consolas", 14, "bold")
@@ -896,6 +962,19 @@ def main(serve_port=None):
 
     lock_btn = styled_btn(ctl, "LOCK", toggle_lock)
     lock_btn.pack(side="left", padx=(0, 8))
+
+    agc_btn = None
+
+    def toggle_agc():
+        with eng.lock:
+            cur = eng.state["params"].get("PP_AGCONOFF", 1)
+        threading.Thread(target=eng.set_param,
+                         args=("PP_AGCONOFF", 0 if cur >= 1 else 1,
+                               "manual toggle", "SET"),
+                         daemon=True).start()
+
+    agc_btn = styled_btn(ctl, "AGC", toggle_agc)
+    agc_btn.pack(side="left", padx=(0, 8))
     styled_btn(ctl, "SAVE TO FLASH",
                lambda: (eng.xvf.save_to_flash(),
                         eng.log("Configuration saved to device flash.")),
@@ -964,6 +1043,25 @@ def main(serve_port=None):
     rec_lbl = tk.Label(rec_row, text="rec idle", bg=BG, fg=GRAY, font=mono)
     rec_lbl.pack(side="left")
 
+    # tuning sliders
+    tune_frame = tk.Frame(root, bg=BG)
+    tune_frame.pack(fill="x", padx=14, pady=(2, 0))
+    scales = {}
+    for name, (label, lo, hi, step) in TUNABLES.items():
+        sc = tk.Scale(tune_frame, from_=lo, to=hi, resolution=step,
+                      orient="horizontal", label=label,
+                      font=("Consolas", 8), bg=BG, fg=RED,
+                      troughcolor=PANEL, highlightthickness=0,
+                      activebackground=RED, bd=0)
+        sc.pack(fill="x")
+        sc.bind("<ButtonRelease-1>",
+                lambda e, n=name: threading.Thread(
+                    target=eng.set_param,
+                    args=(n, scales[n].get(), "manual", "SET"),
+                    daemon=True).start())
+        scales[name] = sc
+    synced = {"done": False}
+
     # log
     log_box = tk.Text(root, bg=PANEL, fg="#9a3d3d", font=("Consolas", 9),
                       relief="solid", bd=1, highlightbackground=DIMRED,
@@ -1004,6 +1102,16 @@ def main(serve_port=None):
         scan_btn.configure(text=f"SCAN {'ON' if s['scan'] else 'OFF'}",
                            fg=BG if s["scan"] else RED,
                            bg=RED if s["scan"] else "#120606")
+
+        agc_on = p.get("PP_AGCONOFF", 1) >= 1
+        agc_btn.configure(text=f"AGC {'ON' if agc_on else 'OFF'}",
+                          fg=BG if agc_on else RED,
+                          bg=RED if agc_on else "#120606")
+        if not synced["done"] and p:
+            for n in TUNABLES:
+                if n in p:
+                    scales[n].set(p[n])
+            synced["done"] = True
 
         if s["beam_lock"]:
             az_txt = ("" if s["locked_az_deg"] is None

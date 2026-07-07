@@ -30,6 +30,7 @@ COMMANDS = {
     "AEC_FIXEDBEAMSONOFF":            (33, 37, 1, "rw", "int32"),
     "AEC_FIXEDBEAMNOISETHR":          (33, 38, 2, "rw", "float"),
     "AUDIO_MGR_MIC_GAIN":             (35, 0, 1, "rw", "float"),
+    "AEC_HPFONOFF":                   (33, 1, 1, "rw", "int32"),
     "DOA_VALUE":                      (20, 18, 2, "ro", "uint16"),
     "LED_EFFECT":                     (20, 12, 1, "rw", "uint8"),
     "LED_BRIGHTNESS":                 (20, 13, 1, "rw", "uint8"),
