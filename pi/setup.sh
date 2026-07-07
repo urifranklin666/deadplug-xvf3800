@@ -6,13 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 sudo apt-get update
-sudo apt-get install -y git python3-venv libportaudio2
+sudo apt-get install -y git python3-venv libportaudio2 libusb-1.0-0
 
+# Prebuilt control binary where one exists (aarch64); on 32-bit ARM
+# (Pi Zero W etc.) this is skipped and the native USB backend is used.
 ./get_xvf_host.sh
 
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install numpy sounddevice
+.venv/bin/pip install -r requirements.txt
 
 # USB permission for the XVF3800 control interface (no sudo needed after this)
 echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2886", ATTRS{idProduct}=="001a", MODE="0666"' \

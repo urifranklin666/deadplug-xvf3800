@@ -13,14 +13,28 @@ Runs on **Windows** (GUI) and **Raspberry Pi** (headless + phone web remote).
 |---|---|
 | `autotune.py` | The main app: capture, VAD, WAV recording (manual + VOX), closed-loop tuning, tkinter GUI, and a built-in web remote |
 | `xvf-tuner.ps1` | Windows-only WPF slider panel for manual parameter tweaking |
-| `get_xvf_host.sh` / `.ps1` | Fetch the platform-matched `xvf_host` control binary from [Seeed's repo](https://github.com/respeaker/reSpeaker_XVF3800_USB_4MIC_ARRAY) |
+| `xvf_usb.py` | Native USB control backend (pyusb) — no `xvf_host` binary needed; also a standalone CLI |
+| `get_xvf_host.sh` / `.ps1` | Fetch the platform-matched `xvf_host` control binary from [Seeed's repo](https://github.com/respeaker/reSpeaker_XVF3800_USB_4MIC_ARRAY) (optional fallback) |
 | `pi/setup.sh` | One-shot Raspberry Pi installer (deps, udev rule, systemd service) |
+
+## Device control backends
+
+The apps talk to the XVF3800's USB control interface two ways, preferring
+the first:
+
+1. **Native USB** (`xvf_usb.py`, via pyusb) — works on any platform with
+   libusb, including **32-bit ARM (Pi Zero W, armv6l)** for which no
+   prebuilt `xvf_host` exists. Also avoids a subprocess per control call.
+2. **`xvf_host` binary** — Seeed's prebuilt tool, fetched by
+   `get_xvf_host.(sh|ps1)` (win32 / linux_x86_64 / rpi_64bit / mac_arm64).
+
+`python xvf_usb.py PP_AGCMAXGAIN` reads a parameter from the CLI;
+add a value to write it.
 
 ## Quickstart — Windows
 
 ```powershell
-.\get_xvf_host.ps1        # fetch the control tool (needs git)
-pip install numpy sounddevice
+pip install -r requirements.txt
 python autotune.py        # GUI
 python autotune.py --serve 8380   # GUI + phone web remote
 ```
@@ -39,6 +53,14 @@ That installs everything, starts a systemd service
 (`journalctl -u xvf-autotune -f` for logs), and prints the web remote URL.
 Open it on your phone (same network) and Add to Home Screen — REC/VOX/AUTO
 buttons, live meter, recordings with in-browser playback.
+
+**Pi Zero W (armv6) notes:** works via the native USB backend (no prebuilt
+`xvf_host` exists for armv6 — `pi/setup.sh` handles this automatically).
+32-bit Raspberry Pi OS pulls numpy from piwheels. Two caveats: the single
+micro-USB OTG port is marginal for powering the array — use a good 5 V/2 A+
+supply or a powered hub — and the single ARM11 core means the web remote is
+usable but not snappy. A **Pi Zero 2 W** (same footprint, aarch64) is the
+smoother choice if you're buying new.
 
 ## The whisper profile
 

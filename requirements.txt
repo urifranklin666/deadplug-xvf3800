@@ -1,0 +1,4 @@
+numpy
+sounddevice
+pyusb
+libusb-package; sys_platform == "win32" or sys_platform == "darwin"

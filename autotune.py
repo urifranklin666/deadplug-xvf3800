@@ -26,6 +26,12 @@ import numpy as np
 import sounddevice as sd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+try:
+    import xvf_usb as _xvf_usb  # native USB control; no binary needed
+except ImportError:
+    _xvf_usb = None
 
 
 def _xvf_host_path():
@@ -76,10 +82,15 @@ def dbfs(x):
 
 
 class Xvf:
-    """Serialised access to xvf_host.exe."""
+    """Serialised device control: native USB (pyusb) when available,
+    otherwise the vendored xvf_host binary. Native is required on
+    platforms with no prebuilt binary (e.g. armv6 / Pi Zero W)."""
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._native = None
+        if _xvf_usb is not None and _xvf_usb.backend_available():
+            self._native = _xvf_usb.XvfUsb()
 
     def _run(self, *args):
         with self._lock:
@@ -96,6 +107,10 @@ class Xvf:
                 return None
 
     def get(self, name):
+        if self._native is not None:
+            with self._lock:
+                vals = self._native.get(name)
+            return [float(v) for v in vals] if vals is not None else None
         out = self._run(name)
         if not out:
             return None
@@ -112,12 +127,21 @@ class Xvf:
         return vals[0] if vals else None
 
     def set(self, name, value):
+        if self._native is not None:
+            with self._lock:
+                return self._native.set(name, value)
         return self._run(name, value) is not None
 
     def set_multi(self, name, *values):
+        if self._native is not None:
+            with self._lock:
+                return self._native.set(name, *values)
         return self._run(name, *[f"{v:.6f}" for v in values]) is not None
 
     def save_to_flash(self):
+        if self._native is not None:
+            with self._lock:
+                return self._native.set("SAVE_CONFIGURATION", 1)
         return self._run("save_configuration", "1") is not None
 
 
@@ -376,6 +400,9 @@ class Engine(threading.Thread):
 
     # ---- main thread loop ----
     def run(self):
+        self.log("Control backend: " +
+                 ("native USB" if self.xvf._native is not None
+                  else "xvf_host binary"))
         self.read_params()
         if self.state["device_ok"]:
             self.log("Device online. " + "  ".join(

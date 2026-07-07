@@ -8,6 +8,10 @@ case "$(uname -s) $(uname -m)" in
   Linux\ aarch64|Linux\ arm64) SUB=rpi_64bit ;;
   Linux\ x86_64)               SUB=linux_x86_64 ;;
   Darwin\ arm64)               SUB=mac_arm64 ;;
+  Linux\ armv6l|Linux\ armv7l)
+    echo "no prebuilt xvf_host for 32-bit ARM ($(uname -m))."
+    echo "not a problem: the apps use the native USB backend (pyusb) instead."
+    exit 0 ;;
   *) echo "unsupported platform: $(uname -s) $(uname -m)"; exit 1 ;;
 esac
 
