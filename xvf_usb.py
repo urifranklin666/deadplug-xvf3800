@@ -34,6 +34,9 @@ COMMANDS = {
     "LED_EFFECT":                     (20, 12, 1, "rw", "uint8"),
     "LED_BRIGHTNESS":                 (20, 13, 1, "rw", "uint8"),
     "LED_COLOR":                      (20, 16, 1, "rw", "uint32"),
+    "LED_DOA_COLOR":                  (20, 17, 2, "rw", "uint32"),
+    "LED_RING_COLOR":                 (20, 19, 12, "rw", "uint32"),
+    "LED_GAMMIFY":                    (20, 14, 1, "rw", "uint8"),
     "PP_AGCONOFF":                    (17, 10, 1, "rw", "int32"),
     "PP_AGCMAXGAIN":                  (17, 11, 1, "rw", "float"),
     "PP_AGCDESIREDLEVEL":             (17, 12, 1, "rw", "float"),
@@ -133,11 +136,20 @@ class XvfUsb:
         if len(values) != cnt:
             return False
         ch, _ = _FMT[ctype]
+
+        def num(v):
+            if isinstance(v, str):
+                try:
+                    return int(v, 0)  # handles hex like 0xFF0000
+                except ValueError:
+                    return float(v)
+            return v
+
         try:
             if ctype == "float":
-                vals = [float(v) for v in values]
+                vals = [float(num(v)) for v in values]
             else:
-                vals = [int(float(v)) for v in values]
+                vals = [int(num(v)) for v in values]
             payload = struct.pack("<" + ch * cnt, *vals)
             self._dev.ctrl_transfer(0x40, 0, cmdid, resid, payload, 5000)
             return True
