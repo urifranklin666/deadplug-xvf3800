@@ -50,6 +50,15 @@ XVF_HOST = _xvf_host_path()
 REC_DIR = os.path.join(HERE, "recordings")
 PREROLL_S = 2.0        # audio kept before REC/VOX trigger
 VOX_HANGOVER_S = 2.5   # keep recording this long after voice stops
+
+# LED scanner (host-driven ring animation; needs the native USB backend)
+LED_COUNT = 12
+LED_AZ_OFFSET = 0.0    # degrees; rotate if the pointer looks misaligned
+LED_DIR = 1            # -1 if the pointer runs the wrong way round
+SCAN_FPS = 20
+SCAN_CHASE_DPS = 120.0  # idle sweep speed, degrees/s
+SCAN_SLEW_DPS = 360.0   # how fast it darts to a voice
+SCAN_HOLD_S = 1.5       # keep focus this long after voice stops
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 SAMPLE_RATE = 48000
@@ -164,7 +173,10 @@ class Engine(threading.Thread):
             "recording": False, "vox": False, "rec_source": None,
             "rec_file": "", "rec_started": 0.0,
             "beam_lock": False, "locked_az_deg": None, "doa_rad": None,
+            "scan": True,
         }
+        self._voice_until = 0.0
+        self._voice_az = None
         self.doa_hist = collections.deque(maxlen=30)  # (t, azimuth) w/ voice
         self._stop = threading.Event()
         self.log_lines = collections.deque(maxlen=200)
@@ -338,6 +350,69 @@ class Engine(threading.Thread):
         self.log("UNLOCK failed: control interface not responding.")
         return False
 
+    # ---- LED scanner ----
+    @staticmethod
+    def _angdiff(d):
+        return ((d + 180.0) % 360.0) - 180.0
+
+    def _led_loop(self):
+        """Knight-Rider chase around the ring; darts to and pulses on the
+        bearing of detected speech. Drives LED_RING_COLOR frame by frame,
+        so it needs the native USB backend (subprocess would be too slow)."""
+        center = 0.0
+        was_on = False
+        last = time.monotonic()
+        while not self._stop.is_set():
+            with self.lock:
+                enabled = (self.state["scan"] and self.state["device_ok"])
+                vad = self.state["vad"]
+            if not enabled:
+                if was_on:
+                    self.xvf.set("LED_EFFECT", 4)  # saved DOA look
+                    was_on = False
+                time.sleep(0.5)
+                last = time.monotonic()
+                continue
+            if not was_on:
+                was_on = self.xvf.set("LED_EFFECT", 5)  # host-driven ring
+                if not was_on:
+                    time.sleep(1.0)
+                    continue
+                self.log("Scanner engaged.")
+            now = time.monotonic()
+            dt = min(now - last, 0.2)
+            last = now
+
+            doa = self.xvf.get("DOA_VALUE")  # [degrees, speech_detected]
+            if doa and (doa[1] or vad):
+                self._voice_until = now + SCAN_HOLD_S
+                self._voice_az = float(doa[0])
+
+            focused = False
+            if now < self._voice_until and self._voice_az is not None:
+                err = self._angdiff(self._voice_az - center)
+                step = max(-SCAN_SLEW_DPS * dt,
+                           min(SCAN_SLEW_DPS * dt, err))
+                center = (center + step) % 360.0
+                focused = abs(err) < 12.0
+            else:
+                center = (center + SCAN_CHASE_DPS * dt) % 360.0
+
+            width = 16.0 if focused else 26.0
+            boost = 0.75 + 0.25 * math.sin(now * 4 * math.pi) \
+                if focused else 1.0
+            colors = []
+            for i in range(LED_COUNT):
+                led_az = (LED_DIR * i * (360.0 / LED_COUNT)
+                          + LED_AZ_OFFSET) % 360.0
+                d = abs(self._angdiff(led_az - center))
+                inten = math.exp(-(d / width) ** 2) * boost
+                colors.append(int(255 * min(1.0, inten) ** 1.8) << 16)
+            self.xvf.set_multi("LED_RING_COLOR", *colors)
+            time.sleep(max(0.0, 1.0 / SCAN_FPS - (time.monotonic() - now)))
+        if was_on:
+            self.xvf.set("LED_EFFECT", 4)
+
     # ---- the control loop ----
     def autotune_step(self, dry_run=False):
         with self.lock:
@@ -403,6 +478,11 @@ class Engine(threading.Thread):
         self.log("Control backend: " +
                  ("native USB" if self.xvf._native is not None
                   else "xvf_host binary"))
+        if self.xvf._native is not None:
+            threading.Thread(target=self._led_loop, daemon=True).start()
+        else:
+            with self.lock:
+                self.state["scan"] = False
         self.read_params()
         if self.state["device_ok"]:
             self.log("Device online. " + "  ".join(
@@ -529,6 +609,7 @@ WEB_PAGE = """<!doctype html>
 <div class="row">
   <button id="rec">REC</button>
   <button id="vox">VOX OFF</button>
+  <button id="scan">SCAN</button>
   <button id="auto">AUTO OFF</button>
   <button id="lock">LOCK</button>
   <button id="save" class="amber">SAVE TO FLASH</button>
@@ -547,6 +628,7 @@ function post(url, body) {
 }
 $('rec').onclick  = () => post('/api/rec', {on: !(state && state.recording)});
 $('vox').onclick  = () => post('/api/toggle', {what:'vox'});
+$('scan').onclick = () => post('/api/toggle', {what:'scan'});
 $('auto').onclick = () => post('/api/toggle', {what:'auto'});
 $('lock').onclick = () => post('/api/lock', {on: !(state && state.beam_lock)});
 $('save').onclick = () => post('/api/save');
@@ -588,6 +670,8 @@ async function tick() {
     $('rec').className = s.recording ? 'on' : '';
     $('vox').textContent = 'VOX ' + (s.vox ? 'ON' : 'OFF');
     $('vox').className = s.vox ? 'on' : '';
+    $('scan').textContent = 'SCAN ' + (s.scan ? 'ON' : 'OFF');
+    $('scan').className = s.scan ? 'on' : '';
     $('auto').textContent = 'AUTO ' + (s.auto ? 'ON' : 'OFF');
     $('auto').className = s.auto ? 'on' : '';
     $('lock').textContent = s.beam_lock
@@ -669,7 +753,7 @@ def make_handler(eng):
                 body = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 body = {}
-            if self.path == "/api/toggle" and body.get("what") in ("auto", "vox"):
+            if self.path == "/api/toggle" and body.get("what") in ("auto", "vox", "scan"):
                 what = body["what"]
                 with eng.lock:
                     eng.state[what] = not eng.state[what]
@@ -859,6 +943,15 @@ def main(serve_port=None):
 
     vox_btn = styled_btn(rec_row, "VOX OFF", toggle_vox)
     vox_btn.pack(side="left", padx=(0, 8))
+
+    scan_btn = None
+
+    def toggle_scan():
+        with eng.lock:
+            eng.state["scan"] = not eng.state["scan"]
+
+    scan_btn = styled_btn(rec_row, "SCAN", toggle_scan)
+    scan_btn.pack(side="left", padx=(0, 8))
     def open_rec_dir():
         os.makedirs(REC_DIR, exist_ok=True)
         if sys.platform == "win32":
@@ -907,6 +1000,10 @@ def main(serve_port=None):
             f"TARGET LVL {p.get('PP_AGCDESIREDLEVEL', 0):g}   "
             f"NS {p.get('PP_MIN_NS', 0):g}/{p.get('PP_MIN_NN', 0):g}   "
             f"LAST: {s['last_action']}"))
+
+        scan_btn.configure(text=f"SCAN {'ON' if s['scan'] else 'OFF'}",
+                           fg=BG if s["scan"] else RED,
+                           bg=RED if s["scan"] else "#120606")
 
         if s["beam_lock"]:
             az_txt = ("" if s["locked_az_deg"] is None
