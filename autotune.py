@@ -77,6 +77,19 @@ SILENCE_DBFS = -80.0      # startup/underrun zeros; excluded from floor tracking
 OVERSHOOT_PEAK_DB = -6.0
 OVERSHOOT_DROP_DB = 12.0
 
+# known-good baseline (the tuned whisper profile) for the DEFAULTS button
+DEFAULTS = {
+    "AUDIO_MGR_MIC_GAIN": 90,
+    "PP_AGCONOFF": 1,
+    "PP_AGCMAXGAIN": 160,
+    "PP_AGCDESIREDLEVEL": 0.007,
+    "PP_AGCTIME": 0.9,
+    "PP_AGCFASTTIME": 0.2,
+    "PP_MIN_NS": 0.35,
+    "PP_MIN_NN": 0.6,
+    "AEC_HPFONOFF": 2,
+}
+
 # user-tunable device params: name -> (label, lo, hi, step)
 TUNABLES = {
     "AUDIO_MGR_MIC_GAIN": ("MIC GAIN", 0, 255, 1),
@@ -322,6 +335,12 @@ class Engine(threading.Thread):
             self.log(f"{tag}: {name} -> {value:g}  ({reason})")
         else:
             self.log(f"{tag}: {name} write failed (device offline?)")
+
+    def apply_defaults(self):
+        """Restore the tuned whisper baseline on the device."""
+        for name, value in DEFAULTS.items():
+            self.set_param(name, value, "defaults", "SET")
+        self.log("Defaults applied (whisper baseline).")
 
     # ---- beam locking ----
     def lock_beam(self):
@@ -631,6 +650,7 @@ WEB_PAGE = """<!doctype html>
 <details style="margin:10px 0">
   <summary style="color:#ff4444;cursor:pointer">TUNING</summary>
   <div id="tuners"></div>
+  <button id="defaults" style="margin-top:6px">DEFAULTS</button>
 </details>
 <div class="row"><span>TARGET dBFS <b id="tval">-28</b></span>
   <input type="range" id="target" min="-40" max="-15" step="1" value="-28">
@@ -670,6 +690,10 @@ document.querySelectorAll('input[data-p]').forEach(el => {
   el.onchange = () => post('/api/param', {name: el.dataset.p, value: +el.value});
 });
 let tsync = false;
+$('defaults').onclick = async () => {
+  await post('/api/defaults');
+  tsync = false;  // re-sync sliders from device state on next tick
+};
 $('target').oninput = e => { $('tval').textContent = e.target.value; };
 $('target').onchange = e => post('/api/target', {dbfs: +e.target.value});
 function x(db, w) { return Math.max(0, Math.min(w, (db + 70) / 70 * w)); }
@@ -842,6 +866,8 @@ def make_handler(eng):
                     eng.lock_beam()
                 else:
                     eng.unlock_beam()
+            elif self.path == "/api/defaults":
+                eng.apply_defaults()
             elif self.path == "/api/save":
                 eng.xvf.save_to_flash()
                 eng.log("Configuration saved to device flash (web).")
@@ -1046,6 +1072,22 @@ def main(serve_port=None):
     # tuning sliders
     tune_frame = tk.Frame(root, bg=BG)
     tune_frame.pack(fill="x", padx=14, pady=(2, 0))
+    synced = {"done": False}
+
+    tune_head = tk.Frame(tune_frame, bg=BG)
+    tune_head.pack(fill="x")
+    tk.Label(tune_head, text="TUNING", bg=BG, fg=RED,
+             font=("Consolas", 11, "bold")).pack(side="left")
+
+    def apply_defaults_ui():
+        def worker():
+            eng.apply_defaults()
+            synced["done"] = False  # re-sync sliders from device state
+        threading.Thread(target=worker, daemon=True).start()
+
+    styled_btn(tune_head, "DEFAULTS",
+               apply_defaults_ui).pack(side="right")
+
     scales = {}
     for name, (label, lo, hi, step) in TUNABLES.items():
         sc = tk.Scale(tune_frame, from_=lo, to=hi, resolution=step,
@@ -1060,7 +1102,6 @@ def main(serve_port=None):
                     args=(n, scales[n].get(), "manual", "SET"),
                     daemon=True).start())
         scales[name] = sc
-    synced = {"done": False}
 
     # log
     log_box = tk.Text(root, bg=PANEL, fg="#9a3d3d", font=("Consolas", 9),
