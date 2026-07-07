@@ -9,3 +9,6 @@ recordings/
 .venv/
 __pycache__/
 *.pyc
+
+# windows junk
+*.lnk
