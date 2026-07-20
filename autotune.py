@@ -77,18 +77,38 @@ SILENCE_DBFS = -80.0      # startup/underrun zeros; excluded from floor tracking
 OVERSHOOT_PEAK_DB = -6.0
 OVERSHOOT_DROP_DB = 12.0
 
-# known-good baseline (the tuned whisper profile) for the DEFAULTS button
-DEFAULTS = {
-    "AUDIO_MGR_MIC_GAIN": 90,
-    "PP_AGCONOFF": 1,
-    "PP_AGCMAXGAIN": 160,
-    "PP_AGCDESIREDLEVEL": 0.007,
-    "PP_AGCTIME": 0.9,
-    "PP_AGCFASTTIME": 0.2,
-    "PP_MIN_NS": 0.35,
-    "PP_MIN_NN": 0.6,
-    "AEC_HPFONOFF": 2,
+# tuning presets, selectable in-app
+PRESETS = {
+    # factory behavior
+    "STOCK": {
+        "AUDIO_MGR_MIC_GAIN": 90, "PP_AGCONOFF": 1, "PP_AGCMAXGAIN": 64,
+        "PP_AGCDESIREDLEVEL": 0.0045, "PP_AGCTIME": 0.9,
+        "PP_AGCFASTTIME": 0.1, "PP_MIN_NS": 0.15, "PP_MIN_NN": 0.51,
+        "AEC_HPFONOFF": 2,
+    },
+    # the tuned quiet-voice baseline
+    "WHISPER": {
+        "AUDIO_MGR_MIC_GAIN": 90, "PP_AGCONOFF": 1, "PP_AGCMAXGAIN": 160,
+        "PP_AGCDESIREDLEVEL": 0.007, "PP_AGCTIME": 0.9,
+        "PP_AGCFASTTIME": 0.2, "PP_MIN_NS": 0.35, "PP_MIN_NN": 0.6,
+        "AEC_HPFONOFF": 2,
+    },
+    # loud rooms: little gain, aggressive noise suppression, higher HPF
+    "LOUD": {
+        "AUDIO_MGR_MIC_GAIN": 90, "PP_AGCONOFF": 1, "PP_AGCMAXGAIN": 16,
+        "PP_AGCDESIREDLEVEL": 0.003, "PP_AGCTIME": 0.9,
+        "PP_AGCFASTTIME": 0.1, "PP_MIN_NS": 0.1, "PP_MIN_NN": 0.4,
+        "AEC_HPFONOFF": 3,
+    },
+    # maximum whisper reach; expect audible room noise and pumping
+    "EXPERIMENTAL": {
+        "AUDIO_MGR_MIC_GAIN": 90, "PP_AGCONOFF": 1, "PP_AGCMAXGAIN": 300,
+        "PP_AGCDESIREDLEVEL": 0.01, "PP_AGCTIME": 1.5,
+        "PP_AGCFASTTIME": 0.3, "PP_MIN_NS": 0.5, "PP_MIN_NN": 0.7,
+        "AEC_HPFONOFF": 1,
+    },
 }
+DEFAULTS = PRESETS["WHISPER"]
 
 # user-tunable device params: name -> (label, lo, hi, step)
 TUNABLES = {
@@ -196,7 +216,7 @@ class Engine(threading.Thread):
             "recording": False, "vox": False, "rec_source": None,
             "rec_file": "", "rec_started": 0.0,
             "beam_lock": False, "locked_az_deg": None, "doa_rad": None,
-            "scan": False,
+            "scan": False, "leds_on": True,
         }
         self._voice_until = 0.0
         self._voice_az = None
@@ -336,11 +356,25 @@ class Engine(threading.Thread):
         else:
             self.log(f"{tag}: {name} write failed (device offline?)")
 
+    def apply_preset(self, preset):
+        for name, value in PRESETS[preset].items():
+            self.set_param(name, value, f"preset {preset}", "SET")
+        self.log(f"Preset applied: {preset}.")
+
     def apply_defaults(self):
-        """Restore the tuned whisper baseline on the device."""
-        for name, value in DEFAULTS.items():
-            self.set_param(name, value, "defaults", "SET")
-        self.log("Defaults applied (whisper baseline).")
+        self.apply_preset("WHISPER")
+
+    def set_leds(self, on):
+        """LED ring on (flashed DOA effect) or fully dark."""
+        if not on:
+            with self.lock:
+                self.state["scan"] = False  # scanner would relight it
+        if self.xvf.set("LED_EFFECT", 4 if on else 0):
+            with self.lock:
+                self.state["leds_on"] = bool(on)
+            self.log("LEDs " + ("on (DOA mode)." if on else "off."))
+        else:
+            self.log("LED write failed (device offline?)")
 
     # ---- beam locking ----
     def lock_beam(self):
@@ -520,6 +554,10 @@ class Engine(threading.Thread):
             self.log("Device online. " + "  ".join(
                 f"{k.replace('PP_', '')}={v:g}"
                 for k, v in self.state["params"].items()))
+            led = self.xvf.get1("LED_EFFECT")
+            if led is not None:
+                with self.lock:
+                    self.state["leds_on"] = led != 0
             if self.xvf.get1("AEC_FIXEDBEAMSONOFF"):
                 azv = self.xvf.get("AEC_FIXEDBEAMSAZIMUTH_VALUES")
                 with self.lock:
@@ -642,6 +680,7 @@ WEB_PAGE = """<!doctype html>
   <button id="rec">REC</button>
   <button id="vox">VOX OFF</button>
   <button id="scan">SCAN</button>
+  <button id="leds">LEDS</button>
   <button id="auto">AUTO OFF</button>
   <button id="lock">LOCK</button>
   <button id="agc">AGC</button>
@@ -650,7 +689,7 @@ WEB_PAGE = """<!doctype html>
 <details style="margin:10px 0">
   <summary style="color:#ff4444;cursor:pointer">TUNING</summary>
   <div id="tuners"></div>
-  <button id="defaults" style="margin-top:6px">DEFAULTS</button>
+  <div class="row" id="presets" style="margin-top:6px"></div>
 </details>
 <div class="row"><span>TARGET dBFS <b id="tval">-28</b></span>
   <input type="range" id="target" min="-40" max="-15" step="1" value="-28">
@@ -690,10 +729,15 @@ document.querySelectorAll('input[data-p]').forEach(el => {
   el.onchange = () => post('/api/param', {name: el.dataset.p, value: +el.value});
 });
 let tsync = false;
-$('defaults').onclick = async () => {
-  await post('/api/defaults');
-  tsync = false;  // re-sync sliders from device state on next tick
-};
+$('leds').onclick = () => post('/api/leds', {on: !(state && state.leds_on)});
+$('presets').innerHTML = ['STOCK', 'WHISPER', 'LOUD', 'EXPERIMENTAL'].map(n =>
+  '<button data-preset="' + n + '">' + n + '</button>').join('');
+document.querySelectorAll('button[data-preset]').forEach(el => {
+  el.onclick = async () => {
+    await post('/api/preset', {name: el.dataset.preset});
+    tsync = false;  // re-sync sliders from device state on next tick
+  };
+});
 $('target').oninput = e => { $('tval').textContent = e.target.value; };
 $('target').onchange = e => post('/api/target', {dbfs: +e.target.value});
 function x(db, w) { return Math.max(0, Math.min(w, (db + 70) / 70 * w)); }
@@ -734,6 +778,8 @@ async function tick() {
     $('vox').className = s.vox ? 'on' : '';
     $('scan').textContent = 'SCAN ' + (s.scan ? 'ON' : 'OFF');
     $('scan').className = s.scan ? 'on' : '';
+    $('leds').textContent = 'LEDS ' + (s.leds_on ? 'ON' : 'OFF');
+    $('leds').className = s.leds_on ? 'on' : '';
     const agcOn = (p.PP_AGCONOFF || 0) >= 1;
     $('agc').textContent = 'AGC ' + (agcOn ? 'ON' : 'OFF');
     $('agc').className = agcOn ? 'on' : '';
@@ -866,6 +912,15 @@ def make_handler(eng):
                     eng.lock_beam()
                 else:
                     eng.unlock_beam()
+            elif self.path == "/api/preset":
+                name = str(body.get("name", "")).upper()
+                if name in PRESETS:
+                    eng.apply_preset(name)
+                else:
+                    self._send(400, {"error": "unknown preset"})
+                    return
+            elif self.path == "/api/leds":
+                eng.set_leds(bool(body.get("on")))
             elif self.path == "/api/defaults":
                 eng.apply_defaults()
             elif self.path == "/api/save":
@@ -1057,6 +1112,17 @@ def main(serve_port=None):
 
     scan_btn = styled_btn(rec_row, "SCAN", toggle_scan)
     scan_btn.pack(side="left", padx=(0, 8))
+
+    leds_btn = None
+
+    def toggle_leds():
+        with eng.lock:
+            cur = eng.state["leds_on"]
+        threading.Thread(target=eng.set_leds, args=(not cur,),
+                         daemon=True).start()
+
+    leds_btn = styled_btn(rec_row, "LEDS", toggle_leds)
+    leds_btn.pack(side="left", padx=(0, 8))
     def open_rec_dir():
         os.makedirs(REC_DIR, exist_ok=True)
         if sys.platform == "win32":
@@ -1079,14 +1145,15 @@ def main(serve_port=None):
     tk.Label(tune_head, text="TUNING", bg=BG, fg=RED,
              font=("Consolas", 11, "bold")).pack(side="left")
 
-    def apply_defaults_ui():
+    def apply_preset_ui(name):
         def worker():
-            eng.apply_defaults()
+            eng.apply_preset(name)
             synced["done"] = False  # re-sync sliders from device state
         threading.Thread(target=worker, daemon=True).start()
 
-    styled_btn(tune_head, "DEFAULTS",
-               apply_defaults_ui).pack(side="right")
+    for pname in reversed(list(PRESETS)):
+        styled_btn(tune_head, pname,
+                   lambda n=pname: apply_preset_ui(n)).pack(side="right")
 
     scales = {}
     for name, (label, lo, hi, step) in TUNABLES.items():
@@ -1143,6 +1210,10 @@ def main(serve_port=None):
         scan_btn.configure(text=f"SCAN {'ON' if s['scan'] else 'OFF'}",
                            fg=BG if s["scan"] else RED,
                            bg=RED if s["scan"] else "#120606")
+
+        leds_btn.configure(text=f"LEDS {'ON' if s['leds_on'] else 'OFF'}",
+                           fg=BG if s["leds_on"] else RED,
+                           bg=RED if s["leds_on"] else "#120606")
 
         agc_on = p.get("PP_AGCONOFF", 1) >= 1
         agc_btn.configure(text=f"AGC {'ON' if agc_on else 'OFF'}",
