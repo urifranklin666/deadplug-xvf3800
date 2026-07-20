@@ -229,6 +229,7 @@ class Engine(threading.Thread):
         self._wav = None
         self._wav_lock = threading.Lock()
         self._last_voice = 0.0
+        self.listeners = set()  # per-client queues for /live.pcm
 
     # ---- logging ----
     def log(self, msg):
@@ -290,6 +291,14 @@ class Engine(threading.Thread):
         with self.lock:
             if self.state["recording"]:
                 self.rec_q.put(mono)
+            listeners = list(self.listeners)
+        if listeners:
+            data = self._to_i16(mono)
+            for q in listeners:
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    pass  # slow client: drop rather than lag
             nf = self.state["noise_floor_db"]
             if rms > SILENCE_DBFS:
                 # fast to fall, slow to rise: tracks the quiet between words
@@ -382,6 +391,16 @@ class Engine(threading.Thread):
             self.log(f"{tag}: {name} -> {value:g}  ({reason})")
         else:
             self.log(f"{tag}: {name} write failed (device offline?)")
+
+    def add_listener(self):
+        q = queue.Queue(maxsize=50)  # ~5 s backlog cap
+        with self.lock:
+            self.listeners.add(q)
+        return q
+
+    def remove_listener(self, q):
+        with self.lock:
+            self.listeners.discard(q)
 
     def apply_preset(self, preset):
         for name, value in PRESETS[preset].items():
@@ -696,6 +715,7 @@ WEB_PAGE = """<!doctype html>
   <button id="vox">VOX OFF</button>
   <button id="scan">SCAN</button>
   <button id="leds">LEDS</button>
+  <button id="listen">LISTEN</button>
   <button id="auto">AUTO OFF</button>
   <button id="lock">LOCK</button>
   <button id="agc">AGC</button>
@@ -745,6 +765,55 @@ document.querySelectorAll('input[data-p]').forEach(el => {
 });
 let tsync = false;
 $('leds').onclick = () => post('/api/leds', {on: !(state && state.leds_on)});
+
+// live listen: stream raw PCM, schedule through Web Audio
+let audioCtx = null, listenAbort = null;
+function setListenUi(on) {
+  $('listen').textContent = on ? 'LISTENING' : 'LISTEN';
+  $('listen').className = on ? 'on' : '';
+}
+function stopListen() {
+  if (listenAbort) listenAbort.abort();
+  listenAbort = null;
+  if (audioCtx) audioCtx.close();
+  audioCtx = null;
+  setListenUi(false);
+}
+async function startListen() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  listenAbort = new AbortController();
+  setListenUi(true);
+  try {
+    const resp = await fetch('/live.pcm', {signal: listenAbort.signal});
+    if (!resp.ok) throw new Error('no audio');
+    const sr = +resp.headers.get('X-Sample-Rate') || 16000;
+    const reader = resp.body.getReader();
+    let playT = 0, carry = new Uint8Array(0);
+    while (audioCtx) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      let bytes = new Uint8Array(carry.length + value.length);
+      bytes.set(carry); bytes.set(value, carry.length);
+      const usable = bytes.length - (bytes.length % 2);
+      carry = bytes.slice(usable);
+      if (!usable) continue;
+      const i16 = new Int16Array(bytes.buffer.slice(0, usable));
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+      const buf = audioCtx.createBuffer(1, f32.length, sr);
+      buf.getChannelData(0).set(f32);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      if (playT < audioCtx.currentTime + 0.05)
+        playT = audioCtx.currentTime + 0.2;  // jitter buffer
+      src.start(playT);
+      playT += buf.duration;
+    }
+  } catch (e) { /* aborted or stream ended */ }
+  stopListen();
+}
+$('listen').onclick = () => { audioCtx ? stopListen() : startListen(); };
 $('presets').innerHTML = ['STOCK', 'WHISPER', 'LOUD', 'EXPERIMENTAL'].map(n =>
   '<button data-preset="' + n + '">' + n + '</button>').join('');
 document.querySelectorAll('button[data-preset]').forEach(el => {
@@ -872,6 +941,30 @@ def make_handler(eng):
                                         "mtime": st.st_mtime})
                 out.sort(key=lambda r: r["mtime"], reverse=True)
                 self._send(200, out)
+            elif self.path == "/live.pcm":
+                sr = eng.sample_rate
+                if not sr:
+                    self._send(503, {"error": "no audio"})
+                    return
+                q = eng.add_listener()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "application/octet-stream")
+                    self.send_header("X-Sample-Rate", str(sr))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    idle = 0
+                    while idle < 3:
+                        try:
+                            self.wfile.write(q.get(timeout=5))
+                            idle = 0
+                        except queue.Empty:
+                            idle += 1  # capture stalled; give up after 15 s
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+                finally:
+                    eng.remove_listener(q)
             elif self.path.startswith("/rec/"):
                 name = os.path.basename(self.path[len("/rec/"):])
                 path = os.path.join(REC_DIR, name)
