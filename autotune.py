@@ -230,6 +230,7 @@ class Engine(threading.Thread):
         self._wav_lock = threading.Lock()
         self._last_voice = 0.0
         self._last_cb = 0.0  # last audio-callback time, for the watchdog
+        self._last_status_log = 0.0
         self.listeners = set()  # per-client queues for /live.pcm
 
     # ---- logging ----
@@ -243,11 +244,15 @@ class Engine(threading.Thread):
         """Ranked candidate input devices: WASAPI first, then DirectSound.
         Refreshes PortAudio's device snapshot first — indices go stale after
         the XVF3800 re-enumerates, which can silently remap to WDM-KS."""
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception:
-            pass
+        # Windows only: WASAPI/WDM indices go stale and need a full PortAudio
+        # reinit. On Linux/ALSA this reinit can deadlock while a stream handle
+        # is still open, and hw:X,0 device names are stable, so skip it.
+        if sys.platform == "win32":
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
         ranked = []
         for i, d in enumerate(sd.query_devices()):
             if "XVF3800" not in d["name"] or d["max_input_channels"] < 1:
@@ -256,6 +261,19 @@ class Engine(threading.Thread):
             rank = 0 if "WASAPI" in api else 1 if "DirectSound" in api else 2
             ranked.append((rank, i))
         return [i for _, i in sorted(ranked)]
+
+    @staticmethod
+    def _close_stream_async(stream):
+        """Tear down a (possibly dead) stream without blocking the run loop —
+        abort()/close() on a re-enumerated ALSA handle can hang."""
+        def worker():
+            for fn in (lambda: stream.abort(ignore_errors=True),
+                       lambda: stream.close(ignore_errors=True)):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True).start()
 
     def _open_stream(self):
         """Try candidate devices and sample rates (device default first —
@@ -275,6 +293,7 @@ class Engine(threading.Thread):
                     s = sd.InputStream(
                         device=idx, samplerate=sr, channels=ch,
                         blocksize=int(sr * BLOCK_S), dtype="float32",
+                        latency="high",  # bigger ALSA buffers; fewer xruns
                         callback=self._audio_cb)
                     s.start()
                     self.sample_rate = sr
@@ -286,6 +305,9 @@ class Engine(threading.Thread):
 
     def _audio_cb(self, indata, frames, t, status):
         self._last_cb = time.monotonic()
+        if status and self._last_cb - self._last_status_log > 2.0:
+            self._last_status_log = self._last_cb
+            self.log(f"audio status: {status}")  # xruns etc. from PortAudio
         mono = indata[:, 0].copy()
         rms = dbfs(np.sqrt(np.mean(mono ** 2)))
         peak = dbfs(np.max(np.abs(mono)))
@@ -643,11 +665,7 @@ class Engine(threading.Thread):
                 self.log("Capture stalled (device re-enumerated?); reopening.")
                 with self.lock:
                     self.state["audio_ok"] = False
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
+                self._close_stream_async(stream)
                 stream = None
                 time.sleep(1.0)
                 continue
