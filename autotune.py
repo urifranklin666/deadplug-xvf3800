@@ -61,8 +61,8 @@ SCAN_SLEW_DPS = 360.0   # how fast it darts to a voice
 SCAN_HOLD_S = 1.5       # keep focus this long after voice stops
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-SAMPLE_RATE = 48000
-BLOCK = 4800  # 100 ms
+BLOCK_S = 0.1  # analysis block duration; sample rate is negotiated per-device
+RATE_CANDIDATES = (48000, 16000)
 
 # Control-loop targets and bounds. The device AGC is an inner feedback loop;
 # this outer loop must stay slow (one small step per cycle) or they fight.
@@ -205,7 +205,7 @@ class Engine(threading.Thread):
         self.xvf = Xvf()
         self.log_q = queue.Queue()
         self.lock = threading.Lock()
-        self.blocks = collections.deque(maxlen=int(10.0 / (BLOCK / SAMPLE_RATE)))
+        self.blocks = collections.deque(maxlen=int(10.0 / BLOCK_S))
         self.state = {
             "audio_ok": False, "device_ok": False,
             "rms_db": -90.0, "peak_db": -90.0,
@@ -222,9 +222,9 @@ class Engine(threading.Thread):
         self._voice_az = None
         self.doa_hist = collections.deque(maxlen=30)  # (t, azimuth) w/ voice
         self._stop = threading.Event()
+        self.sample_rate = None
         self.log_lines = collections.deque(maxlen=200)
-        self.preroll = collections.deque(
-            maxlen=int(PREROLL_S / (BLOCK / SAMPLE_RATE)))
+        self.preroll = collections.deque(maxlen=int(PREROLL_S / BLOCK_S))
         self.rec_q = queue.Queue()
         self._wav = None
         self._wav_lock = threading.Lock()
@@ -254,6 +254,33 @@ class Engine(threading.Thread):
             rank = 0 if "WASAPI" in api else 1 if "DirectSound" in api else 2
             ranked.append((rank, i))
         return [i for _, i in sorted(ranked)]
+
+    def _open_stream(self):
+        """Try candidate devices and sample rates (device default first —
+        ALSA exposes the XVF3800's raw 16 kHz endpoint, WASAPI resamples
+        to 48 kHz). Returns (started_stream, description_or_error)."""
+        last_err = "no XVF3800 input device found"
+        for idx in self._find_devices():
+            d = sd.query_devices(idx)
+            ch = min(2, int(d["max_input_channels"])) or 1
+            rates = []
+            default = int(d.get("default_samplerate") or 0)
+            for r in (default,) + RATE_CANDIDATES:
+                if r > 0 and r not in rates:
+                    rates.append(r)
+            for sr in rates:
+                try:
+                    s = sd.InputStream(
+                        device=idx, samplerate=sr, channels=ch,
+                        blocksize=int(sr * BLOCK_S), dtype="float32",
+                        callback=self._audio_cb)
+                    s.start()
+                    self.sample_rate = sr
+                    api = sd.query_hostapis(d["hostapi"])["name"]
+                    return s, f"{d['name']} [{api}] {sr} Hz {ch}ch"
+                except Exception as e:
+                    last_err = e
+        return None, last_err
 
     def _audio_cb(self, indata, frames, t, status):
         mono = indata[:, 0].copy()
@@ -297,7 +324,7 @@ class Engine(threading.Thread):
         w = wave.open(path, "wb")
         w.setnchannels(1)
         w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
+        w.setframerate(self.sample_rate or 48000)
         for blk in list(self.preroll):
             w.writeframes(self._to_i16(blk))
         with self._wav_lock:
@@ -573,27 +600,15 @@ class Engine(threading.Thread):
         last_cycle = last_telem = 0.0
         while not self._stop.is_set():
             if stream is None:
-                last_err = "no XVF3800 input device found"
-                for idx in self._find_devices():
-                    try:
-                        d = sd.query_devices(idx)
-                        stream = sd.InputStream(
-                            device=idx, samplerate=SAMPLE_RATE, channels=2,
-                            blocksize=BLOCK, dtype="float32",
-                            callback=self._audio_cb)
-                        stream.start()
-                        with self.lock:
-                            self.state["audio_ok"] = True
-                        api = sd.query_hostapis(d["hostapi"])["name"]
-                        self.log(f"Capture started: {d['name']} [{api}]")
-                        break
-                    except Exception as e:
-                        stream = None
-                        last_err = e
-                if stream is None:
+                stream, info = self._open_stream()
+                if stream is not None:
+                    with self.lock:
+                        self.state["audio_ok"] = True
+                    self.log(f"Capture started: {info}")
+                else:
                     with self.lock:
                         self.state["audio_ok"] = False
-                    self.log(f"Capture failed ({last_err}); retrying in 5 s")
+                    self.log(f"Capture failed ({info}); retrying in 5 s")
                     time.sleep(5)
                     continue
 
@@ -945,22 +960,21 @@ def serve(eng, port):
 def smoke_test():
     eng = Engine()
     ok_dev = eng.read_params()
-    candidates = eng._find_devices()
-    print(f"device_params_ok={ok_dev} audio_candidates={candidates}")
-    if not candidates:
-        print("SMOKETEST FAIL: no XVF3800 input device")
+    print(f"device_params_ok={ok_dev} "
+          f"audio_candidates={eng._find_devices()}")
+    stream, info = eng._open_stream()
+    if stream is None:
+        print(f"SMOKETEST FAIL: {info}")
         return 1
-    idx = candidates[0]
-    d = sd.query_devices(idx)
-    print(f"using [{idx}] {d['name']} "
-          f"[{sd.query_hostapis(d['hostapi'])['name']}]")
-    with sd.InputStream(device=idx, samplerate=SAMPLE_RATE, channels=2,
-                        blocksize=BLOCK, dtype="float32",
-                        callback=eng._audio_cb):
+    print(f"using {info}")
+    try:
         time.sleep(2.2)
         eng.start_recording("smoketest")
         time.sleep(1.0)
         eng.stop_recording()
+    finally:
+        stream.stop()
+        stream.close()
     s = eng.state
     print(f"rms={s['rms_db']:.1f} dBFS peak={s['peak_db']:.1f} dBFS "
           f"noise_floor={s['noise_floor_db']:.1f} vad={s['vad']} "
