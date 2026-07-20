@@ -60,16 +60,20 @@ if [ -z "$CARD" ]; then
     exit 1
 fi
 echo "Testing capture on hw:${CARD},0 …"
+# Stop the app first, or IT holds the device and the test reads a false busy.
+sudo systemctl stop xvf-autotune 2>/dev/null || true
+sleep 1
 arecord -D "hw:${CARD},0" -f S16_LE -r 16000 -c 2 -d 2 /tmp/xvf_test.wav \
     >/dev/null 2>&1 || true
 SZ=$(stat -c%s /tmp/xvf_test.wav 2>/dev/null || echo 0)
 rm -f /tmp/xvf_test.wav
+sudo systemctl start xvf-autotune 2>/dev/null || true
 if [ "$SZ" -gt 1000 ]; then
-    echo "SUCCESS: raw capture works ($SZ bytes in 2 s). Restarting the app…"
-    sudo systemctl restart xvf-autotune 2>/dev/null || true
-    echo "Done. Watch: journalctl -u xvf-autotune -f"
+    echo "SUCCESS: raw capture works ($SZ bytes in 2 s). App restarted."
+    echo "Watch: journalctl -u xvf-autotune -f"
 else
-    echo "STILL FAILING ($SZ bytes). The match rule may not have applied."
-    echo "Check the device name:  wpctl status  |  pw-cli ls Device"
+    echo "STILL FAILING ($SZ bytes). The XVF3800 is absent from"
+    echo "'pw-cli ls Device' if the rule applied; if so, the app may already"
+    echo "be capturing fine — check: journalctl -u xvf-autotune -f"
     exit 1
 fi
