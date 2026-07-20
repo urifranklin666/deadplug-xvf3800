@@ -662,7 +662,9 @@ class Engine(threading.Thread):
             # (callback stops firing). Tear it down so it reopens on the
             # refreshed device.
             if now - self._last_cb > 3.0:
-                self.log("Capture stalled (device re-enumerated?); reopening.")
+                self.log("Capture stalled (USB re-enum or PipeWire grab); "
+                         "reopening. If this repeats on a Pi, run "
+                         "pi/fix-pipewire.sh.")
                 with self.lock:
                     self.state["audio_ok"] = False
                 self._close_stream_async(stream)

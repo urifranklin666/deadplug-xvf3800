@@ -54,6 +54,12 @@ That installs everything, starts a systemd service
 Open it on your phone (same network) and Add to Home Screen — REC/VOX/AUTO
 buttons, live meter, recordings with in-browser playback.
 
+**PipeWire desktops (Bookworm etc.):** if capture repeatedly stalls with
+`Input/output error` while WirePlumber runs, it's fighting the app for the
+device. `pi/setup.sh` handles this automatically; to apply it by hand later,
+run `./pi/fix-pipewire.sh` (as your login user, not sudo) — it tells
+WirePlumber to leave the XVF3800 alone so the app's raw-ALSA capture works.
+
 **Pi Zero W (armv6) notes:** works via the native USB backend (no prebuilt
 `xvf_host` exists for armv6 — `pi/setup.sh` handles this automatically).
 32-bit Raspberry Pi OS pulls numpy from piwheels. Two caveats: the single

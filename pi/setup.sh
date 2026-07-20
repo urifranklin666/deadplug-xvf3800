@@ -27,6 +27,14 @@ sed "s|@DIR@|$(pwd)|g; s|@USER@|$USER|g" pi/xvf-autotune.service \
 sudo systemctl daemon-reload
 sudo systemctl enable --now xvf-autotune
 
+# On a PipeWire desktop, WirePlumber fights raw-ALSA capture; hand the
+# XVF3800 to this app. No-op on headless/non-PipeWire installs.
+if command -v wireplumber >/dev/null 2>&1; then
+  echo
+  echo "PipeWire detected — freeing the XVF3800 for exclusive capture…"
+  ./pi/fix-pipewire.sh || echo "  (fix-pipewire had trouble; see its output)"
+fi
+
 echo
 echo "Done. Web remote: http://$(hostname -I | awk '{print $1}'):8380"
 echo "Logs: journalctl -u xvf-autotune -f"
