@@ -63,6 +63,10 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 BLOCK_S = 0.1  # analysis block duration; sample rate is negotiated per-device
 RATE_CANDIDATES = (48000, 16000)
+STALL_S = 3.0            # no audio callbacks for this long ⇒ capture stalled
+STALL_REBOOT_AFTER = 3   # consecutive stalls reopening didn't fix ⇒ REBOOT fw
+STALL_HEALTHY_S = 15.0   # a stream delivering this long clears the stall count
+REBOOT_SETTLE_S = 8.0    # wait for USB re-enumeration after a firmware REBOOT
 
 # Control-loop targets and bounds. The device AGC is an inner feedback loop;
 # this outer loop must stay slow (one small step per cycle) or they fight.
@@ -230,6 +234,7 @@ class Engine(threading.Thread):
         self._wav_lock = threading.Lock()
         self._last_voice = 0.0
         self._last_cb = 0.0  # last audio-callback time, for the watchdog
+        self._stall_count = 0  # consecutive capture stalls; escalates to REBOOT
         self._last_status_log = 0.0
         self.listeners = set()  # per-client queues for /live.pcm
 
@@ -640,12 +645,13 @@ class Engine(threading.Thread):
             self.log("ERROR: control interface not responding.")
 
         stream = None
+        stream_started = 0.0
         last_cycle = last_telem = 0.0
         while not self._stop.is_set():
             if stream is None:
                 stream, info = self._open_stream()
                 if stream is not None:
-                    self._last_cb = time.monotonic()
+                    self._last_cb = stream_started = time.monotonic()
                     with self.lock:
                         self.state["audio_ok"] = True
                     self.log(f"Capture started: {info}")
@@ -658,19 +664,36 @@ class Engine(threading.Thread):
 
             now = time.monotonic()
 
-            # watchdog: a USB re-enumeration leaves the stream open but silent
-            # (callback stops firing). Tear it down so it reopens on the
-            # refreshed device.
-            if now - self._last_cb > 3.0:
-                self.log("Capture stalled (USB re-enum or PipeWire grab); "
-                         "reopening. If this repeats on a Pi, run "
-                         "pi/fix-pipewire.sh.")
+            # watchdog: the stream can open yet deliver no callbacks — either a
+            # USB re-enumeration (transient; reopening recovers it) or a wedged
+            # XVF firmware audio pipeline (persistent; the control interface
+            # still answers but no audio flows, and reopening loops forever).
+            # Only a firmware REBOOT clears the wedged case, so escalate to it
+            # after repeated stalls that reopening didn't fix.
+            if now - self._last_cb > STALL_S:
                 with self.lock:
                     self.state["audio_ok"] = False
                 self._close_stream_async(stream)
                 stream = None
-                time.sleep(1.0)
+                self._stall_count += 1
+                if self._stall_count >= STALL_REBOOT_AFTER:
+                    self.log(f"Capture stalled {self._stall_count}x; reopening "
+                             "isn't recovering it — rebooting XVF3800 firmware.")
+                    self.xvf.set("REBOOT", 1)
+                    self._stall_count = 0
+                    time.sleep(REBOOT_SETTLE_S)  # USB re-enumeration
+                else:
+                    self.log("Capture stalled (USB re-enum or PipeWire grab); "
+                             "reopening. If this repeats on a Pi, run "
+                             "pi/fix-pipewire.sh.")
+                    time.sleep(1.0)
                 continue
+
+            # a stream delivering audio for a while is healthy; clear the
+            # escalation counter so a later transient stall starts fresh
+            # instead of triggering an unnecessary REBOOT.
+            if self._stall_count and now - stream_started > STALL_HEALTHY_S:
+                self._stall_count = 0
 
             self._drain_rec()
             with self.lock:
