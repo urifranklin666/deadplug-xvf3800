@@ -200,7 +200,7 @@ class Xvf:
 class Engine(threading.Thread):
     """Audio capture + telemetry + the autotune control loop."""
 
-    def __init__(self):
+    def __init__(self, arm_vox=False):
         super().__init__(daemon=True)
         self.xvf = Xvf()
         self.log_q = queue.Queue()
@@ -213,7 +213,7 @@ class Engine(threading.Thread):
             "agc_gain": 0.0, "doa_deg": None, "beam_energy": 0.0,
             "params": {}, "auto": False, "target_dbfs": TARGET_DBFS_DEFAULT,
             "last_action": "--",
-            "recording": False, "vox": False, "rec_source": None,
+            "recording": False, "vox": bool(arm_vox), "rec_source": None,
             "rec_file": "", "rec_started": 0.0,
             "beam_lock": False, "locked_az_deg": None, "doa_rad": None,
             "scan": False, "leds_on": True,
@@ -229,6 +229,7 @@ class Engine(threading.Thread):
         self._wav = None
         self._wav_lock = threading.Lock()
         self._last_voice = 0.0
+        self._last_cb = 0.0  # last audio-callback time, for the watchdog
         self.listeners = set()  # per-client queues for /live.pcm
 
     # ---- logging ----
@@ -284,6 +285,7 @@ class Engine(threading.Thread):
         return None, last_err
 
     def _audio_cb(self, indata, frames, t, status):
+        self._last_cb = time.monotonic()
         mono = indata[:, 0].copy()
         rms = dbfs(np.sqrt(np.mean(mono ** 2)))
         peak = dbfs(np.max(np.abs(mono)))
@@ -621,6 +623,7 @@ class Engine(threading.Thread):
             if stream is None:
                 stream, info = self._open_stream()
                 if stream is not None:
+                    self._last_cb = time.monotonic()
                     with self.lock:
                         self.state["audio_ok"] = True
                     self.log(f"Capture started: {info}")
@@ -632,6 +635,23 @@ class Engine(threading.Thread):
                     continue
 
             now = time.monotonic()
+
+            # watchdog: a USB re-enumeration leaves the stream open but silent
+            # (callback stops firing). Tear it down so it reopens on the
+            # refreshed device.
+            if now - self._last_cb > 3.0:
+                self.log("Capture stalled (device re-enumerated?); reopening.")
+                with self.lock:
+                    self.state["audio_ok"] = False
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+                stream = None
+                time.sleep(1.0)
+                continue
+
             self._drain_rec()
             with self.lock:
                 vad = self.state["vad"]
@@ -1083,11 +1103,13 @@ def smoke_test():
 
 
 # ------------------------------------------------------------------------ UI
-def main(serve_port=None):
+def main(serve_port=None, arm_vox=False):
     import tkinter as tk
 
-    eng = Engine()
+    eng = Engine(arm_vox=arm_vox)
     eng.start()
+    if arm_vox:
+        eng.log("VOX armed at startup.")
     if serve_port:
         serve(eng, serve_port)
 
@@ -1376,9 +1398,11 @@ def main(serve_port=None):
     root.mainloop()
 
 
-def main_headless(port):
-    eng = Engine()
+def main_headless(port, arm_vox=False):
+    eng = Engine(arm_vox=arm_vox)
     eng.start()
+    if arm_vox:
+        eng.log("VOX armed at startup.")
     serve(eng, port)
     try:
         while True:
@@ -1398,8 +1422,10 @@ if __name__ == "__main__":
                     help="no GUI; run engine + web remote (for Raspberry Pi)")
     ap.add_argument("--serve", type=int, nargs="?", const=8380, default=None,
                     metavar="PORT", help="serve the web remote (default 8380)")
+    ap.add_argument("--vox", action="store_true",
+                    help="arm VOX (record on voice) at startup")
     args = ap.parse_args()
     if args.headless:
-        main_headless(args.serve or 8380)
+        main_headless(args.serve or 8380, arm_vox=args.vox)
     else:
-        main(serve_port=args.serve)
+        main(serve_port=args.serve, arm_vox=args.vox)
